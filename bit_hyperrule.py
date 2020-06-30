@@ -24,6 +24,8 @@ known_dataset_sizes = {
   'oxford_iiit_pet': (224, 224),
   'oxford_flowers102': (224, 224),
   'imagenet2012': (224, 224),
+  'objectnet': (224, 224),
+  'objectnet_bbox': (224, 224),
 }
 
 
@@ -51,7 +53,7 @@ def get_lr(step, dataset_size, base_lr=0.003):
   supports = get_schedule(dataset_size)
   # Linear warmup
   if step < supports[0]:
-    return base_lr * step / supports[0]
+    return base_lr * (step+1) / supports[0]
   # End of training
   elif step >= supports[-1]:
     return None
