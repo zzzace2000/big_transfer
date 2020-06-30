@@ -17,6 +17,7 @@
 #!/usr/bin/env python3
 # coding: utf-8
 from os.path import join as pjoin  # pylint: disable=g-importing-member
+import os
 import time
 
 import numpy as np
@@ -29,6 +30,13 @@ import bit_pytorch.models as models
 
 import bit_common
 import bit_hyperrule
+import models_utils
+import data_utils
+from data_utils import ImagenetBoundingBoxFolder, bbox_collate, DotDict
+import torch.nn.functional as F
+from arch.Inpainting.Baseline import RandomColorWithNoiseInpainter
+from arch.Inpainting.CAInpainter import CAInpainter
+
 
 
 def topk(output, target, ks=(1,)):
@@ -49,6 +57,9 @@ def recycle(iterable):
 def mktrainval(args, logger):
   """Returns train and validation datasets."""
   precrop, crop = bit_hyperrule.get_resolution_from_dataset(args.dataset)
+  if args.test_run: # save memory
+    precrop, crop = 64, 56
+
   train_tx = tv.transforms.Compose([
       tv.transforms.Resize((precrop, precrop)),
       tv.transforms.RandomCrop((crop, crop)),
@@ -62,6 +73,7 @@ def mktrainval(args, logger):
       tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
   ])
 
+  collate_fn = None
   if args.dataset == "cifar10":
     train_set = tv.datasets.CIFAR10(args.datadir, transform=train_tx, train=True, download=True)
     valid_set = tv.datasets.CIFAR10(args.datadir, transform=val_tx, train=False, download=True)
@@ -69,8 +81,40 @@ def mktrainval(args, logger):
     train_set = tv.datasets.CIFAR100(args.datadir, transform=train_tx, train=True, download=True)
     valid_set = tv.datasets.CIFAR100(args.datadir, transform=val_tx, train=False, download=True)
   elif args.dataset == "imagenet2012":
-    train_set = tv.datasets.ImageFolder(pjoin(args.datadir, "train"), train_tx)
-    valid_set = tv.datasets.ImageFolder(pjoin(args.datadir, "val"), val_tx)
+    train_set = tv.datasets.ImageFolder(pjoin(args.datadir, "train"), transform=train_tx)
+    valid_set = tv.datasets.ImageFolder(pjoin(args.datadir, "val"), transform=val_tx)
+  elif args.dataset.startswith('objectnet'): # objectnet and objectnet_bbox
+    valid_set = tv.datasets.ImageFolder('../datasets/objectnet-1.0/imagenet/', transform=val_tx)
+
+    if args.inpaint == 'none':
+      if args.dataset == 'objectnet':
+        train_set = tv.datasets.ImageFolder(pjoin(args.datadir, "train_objectnet"), transform=train_tx)
+      else: # For only images with bounding box
+        train_bbox_file = '../datasets/imagenet/LOC_train_solution.csv'
+        filenames = set(ImagenetBoundingBoxFolder.parse_coord_dict(train_bbox_file))
+        is_valid_file = lambda path: os.path.basename(path) in filenames
+
+        train_set = tv.datasets.ImageFolder(
+          pjoin(args.datadir, "train_objectnet"),
+          is_valid_file=is_valid_file,
+          transform=train_tx)
+    else: # do inpainting
+      train_tx = tv.transforms.Compose([
+        data_utils.Resize((precrop, precrop)),
+        data_utils.RandomCrop((crop, crop)),
+        data_utils.RandomHorizontalFlip(),
+        data_utils.ToTensor(),
+        data_utils.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      ])
+
+      only_imgs_with_bbox = (args.dataset == 'objectnet_bbox')
+      train_set = ImagenetBoundingBoxFolder(
+        root='../datasets/imagenet/train_objectnet',
+        bbox_file='../datasets/imagenet/LOC_train_solution.csv',
+        only_imgs_with_bbox=only_imgs_with_bbox,
+        transform=train_tx)
+      collate_fn = bbox_collate
+
   else:
     raise ValueError(f"Sorry, we have not spent time implementing the "
                      f"{args.dataset} dataset in the PyTorch codebase. "
@@ -93,14 +137,16 @@ def mktrainval(args, logger):
   if micro_batch_size <= len(train_set):
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=micro_batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, drop_last=False)
+        num_workers=args.workers, pin_memory=True, drop_last=False,
+        collate_fn=collate_fn)
   else:
     # In the few-shot cases, the total dataset size might be smaller than the batch-size.
     # In these cases, the default sampler doesn't repeat, so we need to make it do that
     # if we want to match the behaviour from the paper.
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=micro_batch_size, num_workers=args.workers, pin_memory=True,
-        sampler=torch.utils.data.RandomSampler(train_set, replacement=True, num_samples=micro_batch_size))
+        sampler=torch.utils.data.RandomSampler(train_set, replacement=True, num_samples=micro_batch_size),
+        collate_fn=collate_fn)
 
   return train_set, valid_set, train_loader, valid_loader
 
@@ -157,6 +203,12 @@ def mixup_criterion(criterion, pred, y_a, y_b, l):
 
 def main(args):
   logger = bit_common.setup_logger(args)
+  if args.test_run:
+    args.batch = 8
+    args.batch_split = 1
+    args.workers = 1
+
+  logger.info("Args: " + str(args))
 
   # Lets cuDNN benchmark conv implementations and choose the fastest.
   # Only good if sizes stay the same within the main loop!
@@ -169,15 +221,6 @@ def main(args):
 
   logger.info(f"Loading model from {args.model}.npz")
   model = models.KNOWN_MODELS[args.model](head_size=len(valid_set.classes), zero_head=True)
-  model.load_from(np.load(f"{args.model}.npz"))
-
-  logger.info("Moving model onto all GPUs")
-  model = torch.nn.DataParallel(model)
-
-  # Optionally resume from a checkpoint.
-  # Load it to CPU first as we'll move the model to GPU later.
-  # This way, we save a little bit of GPU memory when loading.
-  step = 0
 
   # Note: no weight-decay!
   optim = torch.optim.SGD(model.parameters(), lr=0.003, momentum=0.9)
@@ -195,6 +238,27 @@ def main(args):
     logger.info(f"Resumed at step {step}")
   except FileNotFoundError:
     logger.info("Fine-tuning from BiT")
+    model.load_from(np.load(f"{args.model}.npz"))
+
+  if args.inpaint != 'none' and args.dataset.startswith('objectnet'):
+    if args.inpaint == 'mean':
+      inpaint_model = (lambda x, mask: x*mask)
+    elif args.inpaint == 'random':
+      inpaint_model = RandomColorWithNoiseInpainter((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    elif args.inpaint == 'cagan':
+      inpaint_model = CAInpainter(
+        train_loader.batch_size, checkpoint_dir='./inpainting_models/release_imagenet_256/')
+      inpaint_model.to(device)
+    else:
+      raise NotImplementedError(f"Unkown inpaint {args.inpaint}")
+
+  logger.info("Moving model onto all GPUs")
+  model = torch.nn.DataParallel(model)
+
+  # Optionally resume from a checkpoint.
+  # Load it to CPU first as we'll move the model to GPU later.
+  # This way, we save a little bit of GPU memory when loading.
+  step = 0
 
   model = model.to(device)
   optim.zero_grad()
@@ -216,6 +280,55 @@ def main(args):
 
       if u.interrupted:
         break
+
+      # Handle inpainting
+      if args.inpaint != 'none':
+        bboxes = x.bbox
+        x = x.img
+
+        # No actual bounding box exists in here
+        if bboxes == [None] * len(bboxes):
+          break
+
+        is_bbox_exists = x.new_ones(x.shape[0], dtype=torch.bool)
+        mask = x.new_ones(x.shape[0], 1, *x.shape[2:])
+        for i, bbox in enumerate(bboxes):
+          if bbox is None:
+            is_bbox_exists[i] = False
+            continue
+          for coord_x, coord_y, w, h in zip(bbox.xs, bbox.ys, bbox.ws, bbox.hs):
+            mask[i, 0, coord_y:(coord_y + h), coord_x:(coord_x + w)] = 0.
+
+        impute_x = inpaint_model(x, mask)[is_bbox_exists]
+        impute_y = (-y - 1)[is_bbox_exists]
+
+        x = torch.cat([x, impute_x], dim=0)
+        # label -1 as negative of class 0, -2 as negative of class 1 etc...
+        y = torch.cat([y, impute_y], dim=0)
+
+        def counterfact_cri(logit, y):
+          if torch.all(y >= 0):
+            return F.cross_entropy(logit, y, reduction='mean')
+
+          loss1 = F.cross_entropy(logit[y >= 0], y[y >= 0], reduction='sum')
+
+          cf_logit, cf_y = logit[y < 0], -(y[y < 0] + 1)
+
+          # Implement my own logsumexp trick
+          m, _ = torch.max(cf_logit, dim=1, keepdim=True)
+          exp_logit = torch.exp(cf_logit - m)
+          sum_exp_logit = torch.sum(exp_logit, dim=1)
+
+          eps = 1e-20
+          num = (sum_exp_logit - exp_logit[torch.arange(exp_logit.shape[0]), cf_y])
+          num = torch.log(num + eps)
+          denon = torch.log(sum_exp_logit + eps)
+
+          # Negative log probability
+          loss2 = -(num - denon).sum()
+          return (loss1 + loss2) / y.shape[0]
+
+        cri = counterfact_cri
 
       # Schedule sending to GPU(s)
       x = x.to(device, non_blocking=True)
@@ -284,4 +397,12 @@ if __name__ == "__main__":
   parser.add_argument("--workers", type=int, default=8,
                       help="Number of background threads used to load data.")
   parser.add_argument("--no-save", dest="save", action="store_false")
+
+  # My own arguments
+  parser.add_argument("--inpaint", type=str, default='none',
+                      choices=['mean',  'random',
+                               'cagan', 'none'])
+  parser.add_argument("--test_run", type=int, default=0)
+
+  args = parser.parse_args()
   main(parser.parse_args())
