@@ -15,7 +15,8 @@
 def get_resolution(original_resolution):
   """Takes (H,W) and returns (precrop, crop)."""
   area = original_resolution[0] * original_resolution[1]
-  return (160, 128) if area < 96*96 else (512, 480)
+  # return (160, 128) if area < 96*96 else (512, 480)
+  return (160, 128) if area < 96*96 else (256, 224)
 
 
 known_dataset_sizes = {
@@ -26,6 +27,9 @@ known_dataset_sizes = {
   'imagenet2012': (224, 224),
   'objectnet': (224, 224),
   'objectnet_bbox': (224, 224),
+  'objectnet_no_bbox': (224, 224),
+  'imageneta': (224, 224),
+  'imageneta_bbox': (224, 224),
 }
 
 
@@ -48,12 +52,15 @@ def get_schedule(dataset_size):
     return [500, 6000, 12_000, 18_000, 20_000]
 
 
-def get_lr(step, dataset_size, base_lr=0.003):
+def get_lr(step, dataset_size=None, base_lr=0.003, supports=None):
   """Returns learning-rate for `step` or None at the end."""
-  supports = get_schedule(dataset_size)
+  if supports is None:
+    supports = get_schedule(dataset_size)
   # Linear warmup
   if step < supports[0]:
-    return base_lr * (step+1) / supports[0]
+    lr = base_lr * (step+1) / supports[0]
+    # print(f"Return lr {lr} in step {step}")
+    return lr
   # End of training
   elif step >= supports[-1]:
     return None
@@ -62,4 +69,5 @@ def get_lr(step, dataset_size, base_lr=0.003):
     for s in supports[1:]:
       if s < step:
         base_lr /= 10
+    # print(f"Return lr {base_lr} in step {step}")
     return base_lr

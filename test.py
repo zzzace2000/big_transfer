@@ -10,7 +10,7 @@ from data_utils import bbox_collate
 #       ToTensor(),
 #       Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
 # ])
-ca = CAInpainter(batch_size=24, checkpoint_dir='./inpainting_models/release_imagenet_256/')
+# ca = CAInpainter(batch_size=24, checkpoint_dir='./inpainting_models/release_imagenet_256/')
 
 
 val_tx = tv.transforms.Compose([
@@ -23,14 +23,14 @@ val_tx = tv.transforms.Compose([
 
 data_dir = '../datasets/imagenet/'
 valid_set = ImagenetBoundingBoxFolder(
-    root=pjoin(data_dir, 'train_objectnet/'),
+    root=pjoin(data_dir, 'train_imageneta/'),
     bbox_file=pjoin(data_dir, 'LOC_train_solution.csv'),
     transform=val_tx)
 
 
 valid_loader = torch.utils.data.DataLoader(
-      valid_set, batch_size=128, shuffle=True,
-      num_workers=1, pin_memory=True, drop_last=False,
+      valid_set, batch_size=64, shuffle=True,
+      num_workers=0, pin_memory=True, drop_last=False,
       collate_fn=bbox_collate)
 
 while True:

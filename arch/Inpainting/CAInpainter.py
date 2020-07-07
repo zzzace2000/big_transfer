@@ -14,6 +14,8 @@ class CAInpainter(object):
     def __init__(self, batch_size, checkpoint_dir,
                  pth_mean=(0.5, 0.5, 0.5),
                  pth_std=(0.5, 0.5, 0.5)):
+        self.batch_size = batch_size
+        self.checkpoint_dir = checkpoint_dir
         tf.compat.v1.disable_eager_execution()
 
         self.images_ph = tf.compat.v1.placeholder(tf.float32,
@@ -54,15 +56,29 @@ class CAInpainter(object):
 
         self.sess.run(self.assign_ops)
 
-    def impute_missing_imgs(self, pytorch_image, pytorch_mask):
+    def __call__(self, img, mask):
+        return self.impute_missing_imgs(img, mask)
+
+    def impute_missing_imgs(self, img, mask):
         '''
-        :param pytorch_image: 1 x 3 x 224 x 224
-        :param pytorch_mask: 1 x 3 x 224 x 224. Mask
+        :param img: 1 x 3 x 224 x 224
+        :param mask: 1 x 3 x 224 x 224. Mask
         :return:
         '''
-        pth_img = self.generate_background(pytorch_image, pytorch_mask)
+        # If the passed in batch size is smaller than the specified one,
+        # Put 0 to make it as a full batch
+        orig_batch_size = img.shape[0]
+        if orig_batch_size < self.batch_size:
+            tmp = img.new_zeros(self.batch_size - orig_batch_size, *img.shape[1:])
+            img = torch.cat([img, tmp], dim=0)
 
-        return pytorch_image * pytorch_mask + pth_img * (1. - pytorch_mask)
+            tmp = mask.new_zeros(self.batch_size - orig_batch_size, *mask.shape[1:])
+            mask = torch.cat([mask, tmp], dim=0)
+
+        bgd_img = self.generate_background(img, mask)
+
+        result = img * mask + bgd_img * (1. - mask)
+        return result[:orig_batch_size]
 
     def generate_background(self, pytorch_image, pytorch_mask):
         '''
@@ -99,7 +115,7 @@ class CAInpainter(object):
         pth_img = np.moveaxis(tf_images, 3, 1)
         pth_img = ((pth_img / 255.) - self.pth_mean) / self.pth_std
 
-        pth_img = pytorch_image.new(pth_img)
+        pth_img = pth_img.to(pytorch_image.device)
         pth_img = F.interpolate(pth_img, size=orig_size, mode='bilinear').data
 
         return pth_img

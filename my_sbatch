@@ -1,0 +1,63 @@
+#!/usr/bin/env python
+
+import os, argparse, platform
+
+def mkdir_p(dir):
+    '''make a directory (dir) if it doesn't exist'''
+    if not os.path.exists(dir):
+        os.mkdir(dir)
+
+mkdir_p('./logs')
+
+parser = argparse.ArgumentParser()
+
+# adds only a small portion of the trainer's flag
+parser.add_argument('--name', type=str, required=True)
+parser.add_argument('--gpus', type=int, default=1)
+parser.add_argument('--mem', type=int, default=16)
+parser.add_argument('--partition', type=str, default=None)
+parser.add_argument('--cpu_per_gpu', type=int, default=2)
+parser.add_argument("--test_run", type=int, default=0)
+
+args, unknownargs = parser.parse_known_args()
+
+if args.partition is None:
+    # If in q, use gpu patition. In vaugan, use p100
+    args.partition = 'p100' if platform.node() == 'vremote' else 'gpu'
+
+temp_file = './tmp_sbatch_file.sh'
+
+# #SBATCH —exclude=gpu070
+with open(temp_file, 'w') as fh:
+    fh.write(f"""#!/usr/bin/env bash
+
+## SLURM SUBMIT SCRIPT
+#SBATCH --nodes=1
+
+## choose among nlp or gpu in MARS
+#SBATCH -p {args.partition}
+#SBATCH --gres=gpu:{args.gpus}
+#SBATCH --mem={args.mem}G
+#SBATCH --time=7-00:00:00
+#SBATCH --job-name={args.name}
+#SBATCH --output=logs/{args.name}.log
+#SBATCH --cpus-per-task={args.gpus * args.cpu_per_gpu}
+#SBATCH --qos=normal
+
+## 90 seconds before training ends
+#SBATCH --signal=SIGUSR1@90
+
+source /h/kingsley/.bashrc
+
+conda activate cu101
+
+# -------------------------
+# debugging flags (optional)
+export NCCL_DEBUG=INFO
+export PYTHONFAULTHANDLER=1
+
+{" ".join(unknownargs)} --name {args.name} --test_run 0
+    """)
+
+os.system("sbatch %s" % temp_file)
+os.remove(temp_file)

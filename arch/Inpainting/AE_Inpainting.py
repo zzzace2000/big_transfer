@@ -9,7 +9,7 @@ class InpaintingModel(InpaintingBase):
     Implementation of Globally and Locally Consistent Image Completion
     http://hi.cs.waseda.ac.jp/~iizuka/projects/completion/data/completion_sig2017.pdf
     '''
-    def __init__(self, **kwargs):
+    def __init__(self):
         super(InpaintingModel, self).__init__()
 
         self.impant = nn.Sequential(
@@ -189,7 +189,7 @@ class VAEInpaintModel(VAEInpaintingBase):
 
 
 class VAEWithVarInpaintModel(VAEInpaintModel):
-    def __init__(self, img_width=224, num_training=100000, **kwargs):
+    def __init__(self, img_width=224, num_training=100000, in_mean=None, in_std=None):
         super(VAEWithVarInpaintModel, self).__init__(num_training=num_training)
 
         self.in_transform = None

@@ -19,10 +19,16 @@
 from os.path import join as pjoin  # pylint: disable=g-importing-member
 import os
 import time
+import random
 
 import numpy as np
 import torch
 import torchvision as tv
+import json
+import pandas as pd
+from apex import amp
+import apex
+import torchvision
 
 import bit_pytorch.fewshot as fs
 import bit_pytorch.lbtoolbox as lb
@@ -32,11 +38,10 @@ import bit_common
 import bit_hyperrule
 import models_utils
 import data_utils
-from data_utils import ImagenetBoundingBoxFolder, bbox_collate, DotDict
+from data_utils import ImagenetBoundingBoxFolder, bbox_collate, Sample
 import torch.nn.functional as F
-from arch.Inpainting.Baseline import RandomColorWithNoiseInpainter
+from arch.Inpainting.Baseline import RandomColorWithNoiseInpainter, LocalMeanInpainter
 from arch.Inpainting.CAInpainter import CAInpainter
-
 
 
 def topk(output, target, ks=(1,)):
@@ -55,6 +60,42 @@ def recycle(iterable):
 
 
 def mktrainval(args, logger):
+  if args.dataset not in ['objectnet', 'imageneta'] or args.inpaint == 'none':
+    return _mktrainval(args, logger)
+  else:
+    logger.info(f"Composing 2 loaders for {args.dataset} w/ inpaint {args.inpaint}")
+    # Compose 2 loaders: 1 w/ inpaint as true and dataset == 'objectnet_bbox'
+    # The other would be having 1 w/ inpaint == 'none' and dataset == 'objectnet_no_bbox'
+    orig_inpaint = args.inpaint
+    orig_dataset = args.dataset
+
+    args.dataset = f'{orig_dataset}_bbox'
+    f_n_train, n_classes, f_train_loader, valid_loader = mktrainval(args, logger)
+    args.dataset = f'{orig_dataset}_no_bbox'
+    args.inpaint = 'none'
+    s_n_train, _, s_train_loader, _ = mktrainval(args, logger)
+
+    n_train = f_n_train + s_n_train
+    def composed_train_loader():
+      loaders = [f_train_loader, s_train_loader]
+      order = np.random.randint(low=0, high=2)
+      for s in loaders[order]:
+        yield s
+      logger.info(f"Finish the {order} loader. (0 means bbox, 1 means no bbox)")
+      for s in loaders[1 - order]:
+        yield s
+      logger.info(f"Finish the {1 - order} loader. (0 means bbox, 1 means no bbox)")
+
+    train_loader = composed_train_loader()
+
+    # Set everything back
+    args.dataset = orig_dataset
+    args.inpaint = orig_inpaint
+    logger.info(f"Using a total training set {n_train} images")
+    return n_train, n_classes, train_loader, valid_loader
+
+
+def _mktrainval(args, logger):
   """Returns train and validation datasets."""
   precrop, crop = bit_hyperrule.get_resolution_from_dataset(args.dataset)
   if args.test_run: # save memory
@@ -74,6 +115,8 @@ def mktrainval(args, logger):
   ])
 
   collate_fn = None
+  n_train = None
+  micro_batch_size = args.batch // args.batch_split
   if args.dataset == "cifar10":
     train_set = tv.datasets.CIFAR10(args.datadir, transform=train_tx, train=True, download=True)
     valid_set = tv.datasets.CIFAR10(args.datadir, transform=val_tx, train=False, download=True)
@@ -83,19 +126,27 @@ def mktrainval(args, logger):
   elif args.dataset == "imagenet2012":
     train_set = tv.datasets.ImageFolder(pjoin(args.datadir, "train"), transform=train_tx)
     valid_set = tv.datasets.ImageFolder(pjoin(args.datadir, "val"), transform=val_tx)
-  elif args.dataset.startswith('objectnet'): # objectnet and objectnet_bbox
-    valid_set = tv.datasets.ImageFolder('../datasets/objectnet-1.0/imagenet/', transform=val_tx)
+  elif args.dataset.startswith('objectnet') or args.dataset.startswith('imageneta'): # objectnet and objectnet_bbox and objectnet_no_bbox
+    identifier = 'objectnet' if args.dataset.startswith('objectnet') else 'imageneta'
+    valid_set = tv.datasets.ImageFolder(f"../datasets/{identifier}/", transform=val_tx)
 
     if args.inpaint == 'none':
-      if args.dataset == 'objectnet':
-        train_set = tv.datasets.ImageFolder(pjoin(args.datadir, "train_objectnet"), transform=train_tx)
-      else: # For only images with bounding box
-        train_bbox_file = '../datasets/imagenet/LOC_train_solution.csv'
-        filenames = set(ImagenetBoundingBoxFolder.parse_coord_dict(train_bbox_file))
-        is_valid_file = lambda path: os.path.basename(path) in filenames
+      if args.dataset == 'objectnet' or args.dataset == 'imageneta':
+        train_set = tv.datasets.ImageFolder(pjoin(args.datadir, f"train_{args.dataset}"),
+                                            transform=train_tx)
+      else: # For only images with or w/o bounding box
+        train_bbox_file = '../datasets/imagenet/LOC_train_solution_size.csv'
+        df = pd.read_csv(train_bbox_file)
+        filenames = set(df[df.bbox_ratio <= args.bbox_max_ratio].ImageId)
+        if args.dataset == f"{identifier}_no_bbox":
+          is_valid_file = lambda path: os.path.basename(path).split('.')[0] not in filenames
+        elif args.dataset == f"{identifier}_bbox":
+          is_valid_file = lambda path: os.path.basename(path).split('.')[0] in filenames
+        else:
+          raise NotImplementedError()
 
         train_set = tv.datasets.ImageFolder(
-          pjoin(args.datadir, "train_objectnet"),
+          pjoin(args.datadir, f"train_{identifier}"),
           is_valid_file=is_valid_file,
           transform=train_tx)
     else: # do inpainting
@@ -107,13 +158,13 @@ def mktrainval(args, logger):
         data_utils.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
       ])
 
-      only_imgs_with_bbox = (args.dataset == 'objectnet_bbox')
       train_set = ImagenetBoundingBoxFolder(
-        root='../datasets/imagenet/train_objectnet',
+        root=f"../datasets/imagenet/train_{identifier}",
         bbox_file='../datasets/imagenet/LOC_train_solution.csv',
-        only_imgs_with_bbox=only_imgs_with_bbox,
         transform=train_tx)
       collate_fn = bbox_collate
+      n_train = len(train_set) * 2
+      micro_batch_size //= 2
 
   else:
     raise ValueError(f"Sorry, we have not spent time implementing the "
@@ -127,8 +178,6 @@ def mktrainval(args, logger):
 
   logger.info(f"Using a training set with {len(train_set)} images.")
   logger.info(f"Using a validation set with {len(valid_set)} images.")
-
-  micro_batch_size = args.batch // args.batch_split
 
   valid_loader = torch.utils.data.DataLoader(
       valid_set, batch_size=micro_batch_size, shuffle=False,
@@ -148,7 +197,9 @@ def mktrainval(args, logger):
         sampler=torch.utils.data.RandomSampler(train_set, replacement=True, num_samples=micro_batch_size),
         collate_fn=collate_fn)
 
-  return train_set, valid_set, train_loader, valid_loader
+  if n_train is None:
+    n_train = len(train_set)
+  return n_train, len(valid_set.classes), train_loader, valid_loader
 
 
 def run_eval(model, data_loader, device, chrono, logger, step):
@@ -210,23 +261,48 @@ def main(args):
 
   logger.info("Args: " + str(args))
 
-  # Lets cuDNN benchmark conv implementations and choose the fastest.
-  # Only good if sizes stay the same within the main loop!
-  torch.backends.cudnn.benchmark = True
+  # Fix seed
+  # torch.manual_seed(args.seed)
+  # torch.backends.cudnn.deterministic = True
+  # torch.backends.cudnn.benchmark = False
+  # np.random.seed(args.seed)
+  # random.seed(args.seed)
+
+  # Speed up
+  torch.backends.cudnn.banchmark = True
 
   device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
   logger.info(f"Going to train on {device}")
 
-  train_set, valid_set, train_loader, valid_loader = mktrainval(args, logger)
+  n_train, n_classes, train_loader, valid_loader = mktrainval(args, logger)
 
-  logger.info(f"Loading model from {args.model}.npz")
-  model = models.KNOWN_MODELS[args.model](head_size=len(valid_set.classes), zero_head=True)
+  if args.inpaint != 'none':
+    if args.inpaint == 'mean':
+      inpaint_model = (lambda x, mask: x*mask)
+    elif args.inpaint == 'random':
+      inpaint_model = RandomColorWithNoiseInpainter((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    elif args.inpaint == 'local':
+      inpaint_model = LocalMeanInpainter(window=)
+    elif args.inpaint == 'cagan':
+      inpaint_model = CAInpainter(
+        valid_loader.batch_size, checkpoint_dir='./inpainting_models/release_imagenet_256/')
+    else:
+      raise NotImplementedError(f"Unkown inpaint {args.inpaint}")
 
-  # Note: no weight-decay!
-  optim = torch.optim.SGD(model.parameters(), lr=0.003, momentum=0.9)
+
+  logger.info(f"Training {args.model}")
+  if args.model in models.KNOWN_MODELS:
+    model = models.KNOWN_MODELS[args.model](head_size=n_classes, zero_head=True)
+  else: # from torchvision
+    model = getattr(torchvision.models, args.model)(pretrained=args.finetune)
 
   # Resume fine-tuning if we find a saved model.
-  savename = pjoin(args.logdir, args.name, "bit.pth.tar")
+  step = 0
+
+  # Optionally resume from a checkpoint.
+  # Load it to CPU first as we'll move the model to GPU later.
+  # This way, we save a little bit of GPU memory when loading.
+  savename = pjoin(args.logdir, args.name, "model.pt")
   try:
     logger.info(f"Model will be saved in '{savename}'")
     checkpoint = torch.load(savename, map_location="cpu")
@@ -234,38 +310,55 @@ def main(args):
 
     step = checkpoint["step"]
     model.load_state_dict(checkpoint["model"])
+    model = model.to(device)
+
+    # Note: no weight-decay!
+    optim = torch.optim.SGD(model.parameters(), lr=0.003, momentum=0.9)
     optim.load_state_dict(checkpoint["optim"])
     logger.info(f"Resumed at step {step}")
   except FileNotFoundError:
-    logger.info("Fine-tuning from BiT")
-    model.load_from(np.load(f"{args.model}.npz"))
+    if args.finetune:
+      logger.info("Fine-tuning from BiT")
+      model.load_from(np.load(f"models/{args.model}.npz"))
 
-  if args.inpaint != 'none' and args.dataset.startswith('objectnet'):
-    if args.inpaint == 'mean':
-      inpaint_model = (lambda x, mask: x*mask)
-    elif args.inpaint == 'random':
-      inpaint_model = RandomColorWithNoiseInpainter((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    elif args.inpaint == 'cagan':
-      inpaint_model = CAInpainter(
-        train_loader.batch_size, checkpoint_dir='./inpainting_models/release_imagenet_256/')
-      inpaint_model.to(device)
-    else:
-      raise NotImplementedError(f"Unkown inpaint {args.inpaint}")
+    model = model.to(device)
+    optim = torch.optim.SGD(model.parameters(), lr=0.003, momentum=0.9)
+
+  if args.fp16:
+    model, optim = amp.initialize(model, optim, opt_level="O1")
 
   logger.info("Moving model onto all GPUs")
   model = torch.nn.DataParallel(model)
 
-  # Optionally resume from a checkpoint.
-  # Load it to CPU first as we'll move the model to GPU later.
-  # This way, we save a little bit of GPU memory when loading.
-  step = 0
-
-  model = model.to(device)
   optim.zero_grad()
 
   model.train()
-  mixup = bit_hyperrule.get_mixup(len(train_set))
+  mixup = 0
+  if args.mixup:
+    mixup = bit_hyperrule.get_mixup(n_train)
+
   cri = torch.nn.CrossEntropyLoss().to(device)
+  def counterfact_cri(logit, y):
+    if torch.all(y >= 0):
+      return F.cross_entropy(logit, y, reduction='mean')
+
+    loss1 = F.cross_entropy(logit[y >= 0], y[y >= 0], reduction='sum')
+
+    cf_logit, cf_y = logit[y < 0], -(y[y < 0] + 1)
+
+    # Implement my own logsumexp trick
+    m, _ = torch.max(cf_logit, dim=1, keepdim=True)
+    exp_logit = torch.exp(cf_logit - m)
+    sum_exp_logit = torch.sum(exp_logit, dim=1)
+
+    eps = 1e-20
+    num = (sum_exp_logit - exp_logit[torch.arange(exp_logit.shape[0]), cf_y])
+    num = torch.log(num + eps)
+    denon = torch.log(sum_exp_logit + eps)
+
+    # Negative log probability
+    loss2 = -(num - denon).sum()
+    return (loss1 + loss2) / y.shape[0]
 
   logger.info("Starting training!")
   chrono = lb.Chrono()
@@ -282,60 +375,33 @@ def main(args):
         break
 
       # Handle inpainting
-      if args.inpaint != 'none':
+      if not isinstance(x, Sample) or x.bbox == [None] * len(x.bbox):
+        criteron = cri
+      else:
+        criteron = counterfact_cri
+
         bboxes = x.bbox
         x = x.img
 
-        # No actual bounding box exists in here
-        if bboxes == [None] * len(bboxes):
-          break
-
-        is_bbox_exists = x.new_ones(x.shape[0], dtype=torch.bool)
+        # is_bbox_exists = x.new_ones(x.shape[0], dtype=torch.bool)
         mask = x.new_ones(x.shape[0], 1, *x.shape[2:])
         for i, bbox in enumerate(bboxes):
-          if bbox is None:
-            is_bbox_exists[i] = False
-            continue
           for coord_x, coord_y, w, h in zip(bbox.xs, bbox.ys, bbox.ws, bbox.hs):
             mask[i, 0, coord_y:(coord_y + h), coord_x:(coord_x + w)] = 0.
 
-        impute_x = inpaint_model(x, mask)[is_bbox_exists]
-        impute_y = (-y - 1)[is_bbox_exists]
+        impute_x = inpaint_model(x, mask)
+        impute_y = (-y - 1)
 
         x = torch.cat([x, impute_x], dim=0)
         # label -1 as negative of class 0, -2 as negative of class 1 etc...
         y = torch.cat([y, impute_y], dim=0)
-
-        def counterfact_cri(logit, y):
-          if torch.all(y >= 0):
-            return F.cross_entropy(logit, y, reduction='mean')
-
-          loss1 = F.cross_entropy(logit[y >= 0], y[y >= 0], reduction='sum')
-
-          cf_logit, cf_y = logit[y < 0], -(y[y < 0] + 1)
-
-          # Implement my own logsumexp trick
-          m, _ = torch.max(cf_logit, dim=1, keepdim=True)
-          exp_logit = torch.exp(cf_logit - m)
-          sum_exp_logit = torch.sum(exp_logit, dim=1)
-
-          eps = 1e-20
-          num = (sum_exp_logit - exp_logit[torch.arange(exp_logit.shape[0]), cf_y])
-          num = torch.log(num + eps)
-          denon = torch.log(sum_exp_logit + eps)
-
-          # Negative log probability
-          loss2 = -(num - denon).sum()
-          return (loss1 + loss2) / y.shape[0]
-
-        cri = counterfact_cri
 
       # Schedule sending to GPU(s)
       x = x.to(device, non_blocking=True)
       y = y.to(device, non_blocking=True)
 
       # Update learning-rate, including stop training if over.
-      lr = bit_hyperrule.get_lr(step, len(train_set), args.base_lr)
+      lr = bit_hyperrule.get_lr(step, n_train, args.base_lr)
       if lr is None:
         break
       for param_group in optim.param_groups:
@@ -348,14 +414,19 @@ def main(args):
       with chrono.measure("fprop"):
         logits = model(x)
         if mixup > 0.0:
-          c = mixup_criterion(cri, logits, y_a, y_b, mixup_l)
+          c = mixup_criterion(criteron, logits, y_a, y_b, mixup_l)
         else:
-          c = cri(logits, y)
+          c = criteron(logits, y)
         c_num = float(c.data.cpu().numpy())  # Also ensures a sync point.
 
       # Accumulate grads
       with chrono.measure("grads"):
-        (c / args.batch_split).backward()
+        loss = (c / args.batch_split)
+        if args.fp16:
+          with amp.scale_loss(loss, optim) as scaled_loss:
+            scaled_loss.backward()
+        else:
+          loss.backward()
         accum_steps += 1
 
       accstep = f" ({accum_steps}/{args.batch_split})" if args.batch_split > 1 else ""
@@ -378,14 +449,30 @@ def main(args):
           if args.save:
             torch.save({
                 "step": step,
-                "model": model.state_dict(),
-                "optim" : optim.state_dict(),
+                "model": model.module.state_dict(),
+                "optim": optim.state_dict(),
             }, savename)
 
       end = time.time()
 
+    # Save model!!
+    if args.save:
+      torch.save({
+        "step": step,
+        "model": model.module.state_dict(),
+        "optim": optim.state_dict(),
+      }, savename)
+
+    json.dump({
+      'model': args.model,
+      'head_size': n_classes,
+      'inpaint': args.inpaint,
+      'dataset': args.dataset,
+    }, open(pjoin(args.logdir, args.name, 'hyperparams.json'), 'w'))
+
     # Final eval at end of training.
     run_eval(model, valid_loader, device, chrono, logger, step='end')
+
 
   logger.info(f"Timings:\n{chrono}")
 
@@ -400,9 +487,15 @@ if __name__ == "__main__":
 
   # My own arguments
   parser.add_argument("--inpaint", type=str, default='none',
-                      choices=['mean',  'random',
+                      choices=['mean',  'random', 'local',
                                'cagan', 'none'])
+  parser.add_argument("--bbox_subsample_ratio", type=float, default=1)
+  parser.add_argument("--bbox_max_ratio", type=float, default=0.5)
+  parser.add_argument("--mixup", type=int, default=0) # Turn off mixup for now
   parser.add_argument("--test_run", type=int, default=0)
+  parser.add_argument("--fp16", type=int, default=1)
+  parser.add_argument("--seed", type=int, default=1234)
+  parser.add_argument("--finetune", type=int, default=int)
 
   args = parser.parse_args()
   main(parser.parse_args())

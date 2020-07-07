@@ -33,25 +33,19 @@ class LocalMeanInpainter(InpaintTemplate):
         self.conv1 = nn.Conv2d(1, 1, kernel_size=window, padding=padding, bias=False)
         self.conv1.weight.data.fill_(1.)
 
+        self.num_of_existing_pixels = None
+
     def impute_missing_imgs(self, x, mask):
         mean_for_each_pixel = self.generate_background(x, mask)
         return x * mask + mean_for_each_pixel * (1. - mask)
 
     def generate_background(self, x, mask):
-        zero_x = x * mask
-        result = []
-        for i in range(3):
-            result.append(self.conv1(zero_x[:, i:(i + 1), :, :]).data)
-        sum_of_adjaent_pixels = torch.cat(result, dim=1)
+        sum_of_adjaent_pixels = self.conv1(x.view(-1, 1, *x.shape[2:])).data.view(*x.shape)
 
-        num_of_existing_pixels = self.conv1(mask).data
+        if self.num_of_existing_pixels is None:
+            self.num_of_existing_pixels = self.conv1(x.new_ones(x.shape[0], 1, *x.shape[2:])).data
 
-        # Work around for no existing pixels and not to devide by 0
-        tmp = num_of_existing_pixels.expand_as(sum_of_adjaent_pixels)
-        sum_of_adjaent_pixels[tmp == 0] = 0.
-        num_of_existing_pixels[num_of_existing_pixels == 0] = 1
-
-        mean_for_each_pixel = sum_of_adjaent_pixels / num_of_existing_pixels
+        mean_for_each_pixel = sum_of_adjaent_pixels / self.num_of_existing_pixels
         return mean_for_each_pixel
 
 

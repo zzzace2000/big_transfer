@@ -49,7 +49,7 @@ def bbox_collate(batch):
 class ImagenetBoundingBoxFolder(ImageFolder):
     ''' Custom loader that loads images with bounding box '''
 
-    def __init__(self, root, bbox_file, only_imgs_with_bbox=False, **kwargs):
+    def __init__(self, root, bbox_file, only_imgs_with_bbox=True, **kwargs):
         ''' bbox_file points to either `LOC_train_solution.csv` or `LOC_val_solution.csv` '''
         self.coord_dict = self.parse_coord_dict(bbox_file)
         self.only_imgs_with_bbox = only_imgs_with_bbox
@@ -100,9 +100,7 @@ class ImagenetBoundingBoxFolder(ImageFolder):
 
     def __getitem__(self, index):
         """
-        Override this to append the bounding box in the 4th channel.
-        The resulting bounding box would be -1 for background and
-        +1 for within the box.
+        Override this to return the bounding box as well
         """
         path, target = self.samples[index]
         img = self.loader(path)
@@ -126,6 +124,36 @@ class ImagenetBoundingBoxFolder(ImageFolder):
         return sample, target
 
 
+class MyHackSampleSizeMixin(object):
+    '''
+    Custom dataset to hack the lightning framework.
+    To train a fixed number of steps, since lightning only supports
+    epoch-based training. So this hack is to return a dataset that
+    has special length to make resulting loader run for an epoch.
+    '''
+    def __init__(self, root, num_samples=None, **kwargs):
+        self.num_samples = num_samples
+        super().__init__(root, **kwargs)
+
+    def __len__(self):
+        if self.num_samples is None:
+            return super().__len__()
+
+        return self.num_samples
+
+    def __getitem__(self, index):
+        if self.num_samples is None:
+            return super().__getitem__(index)
+
+        actual_len = super().__len__()
+        return super().__getitem__(index % actual_len)
+
+class MyImageFolder(MyHackSampleSizeMixin, ImageFolder):
+    pass
+
+class MyImagenetBoundingBoxFolder(MyHackSampleSizeMixin, ImagenetBoundingBoxFolder):
+    pass
+
 class RandomCrop(tv.transforms.RandomCrop):
     def __call__(self, sample):
         img, bbox = sample.img, sample.bbox
@@ -140,27 +168,57 @@ class RandomCrop(tv.transforms.RandomCrop):
         if self.pad_if_needed and img.size[1] < self.size[0]:
             img = F.pad(img, (0, self.size[0] - img.size[1]), self.fill, self.padding_mode)
 
+        low_i = (bbox.ys - self.size[0]).clamp_(0).min().item()
+        low_j = (bbox.xs - self.size[1]).clamp_(0).min().item()
+
         # It has to contain at least 1 bounding box!
         while True:
-            i, j, h, w = self.get_params(img, self.size)
+            i, j, h, w = self.get_params(img, self.size, low_i=low_i, low_j=low_j)
             if bbox is None:
                 sample.img = F.crop(img, i, j, h, w)
                 return sample
 
-            old_xs, old_ys = bbox.xs.clone(), bbox.ys.clone()
-            bbox.xs.sub_(j).clamp_(min=0)
-            bbox.ys.sub_(i).clamp_(min=0)
-            torch.min(bbox.ws.add_(old_xs).sub_(j).clamp_(min=0).sub_(bbox.xs), (w - bbox.xs), out=bbox.ws)
-            torch.min(bbox.hs.add_(old_ys).sub_(i).clamp_(min=0).sub_(bbox.ys), (h - bbox.ys), out=bbox.hs)
+            new_xs = torch.clamp(bbox.xs - j, min=0)
+            new_ys = torch.clamp(bbox.ys - i, min=0)
+            new_ws = torch.min(
+                ((bbox.ws + bbox.xs) - j).clamp_(min=0).sub_(new_xs),
+                (w - new_xs))
+            new_hs = torch.min(
+                ((bbox.hs + bbox.ys) - i).clamp_(min=0).sub_(new_ys),
+                (h - new_ys))
 
             # At least 1 bounding box is included
-            if torch.any((bbox.ws != 0) & (bbox.hs != 0)):
+            if torch.any((new_ws != 0) & (new_hs != 0)):
                 break
             else:
-                print('Not found at least 1 valid. Re-crop.')
+                print('Not found at least 1 valid bbox. Re-crop.')
 
+        sample.bbox.xs = new_xs
+        sample.bbox.ys = new_ys
+        sample.bbox.ws = new_ws
+        sample.bbox.hs = new_hs
         sample.img = F.crop(img, i, j, h, w)
         return sample
+
+    @staticmethod
+    def get_params(img, output_size, low_i=0, low_j=0):
+        """Get parameters for ``crop`` for a random crop.
+
+        Args:
+            img (PIL Image): Image to be cropped.
+            output_size (tuple): Expected output size of the crop.
+
+        Returns:
+            tuple: params (i, j, h, w) to be passed to ``crop`` for random crop.
+        """
+        w, h = img.width, img.height
+        th, tw = output_size
+        if w == tw and h == th:
+            return 0, 0, h, w
+
+        i = random.randint(low_i, h - th)
+        j = random.randint(low_j, w - tw)
+        return i, j, th, tw
 
 
 class Resize(tv.transforms.Resize):
@@ -188,6 +246,8 @@ class Resize(tv.transforms.Resize):
         sample.bbox.ys.mul_(new_h).div_(h)
         # To be exact for w and h, we calculate the post-coordinate
         # and round the coordinate to get width / height.
+        # sample.bbox.ws.mul_(new_w).div_(w).add_(1)
+        # sample.bbox.hs.mul_(new_h).div_(h).add_(1)
         sample.bbox.ws.add_(old_xs).mul_(new_w).div_(w).add_(1).sub_(sample.bbox.xs)
         sample.bbox.hs.add_(old_ys).mul_(new_h).div_(h).add_(1).sub_(sample.bbox.ys)
         return sample

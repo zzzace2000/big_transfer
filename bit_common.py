@@ -85,7 +85,8 @@ def setup_logger(args):
       },
       "loggers": {
           "": {
-              "handlers": ["stderr", "logfile"],
+              # "handlers": ["stderr", "logfile"],
+              "handlers": ["stderr"],
               "level": "DEBUG",
               "propagate": True
           },
