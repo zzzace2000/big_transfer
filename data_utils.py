@@ -1,13 +1,18 @@
 from torchvision.datasets import ImageFolder
 import torchvision as tv
 import os
+import numpy as np
 from torchvision.transforms import functional as F
 from collections import namedtuple
 import random
 import torch
 from torch.utils.data._utils.collate import default_collate
+from torch.utils.data.dataset import IterableDataset, ConcatDataset, Subset
+from torch.utils.data.dataloader import DataLoader
 import copy
-
+from torch.utils.data.sampler import Sampler
+import bisect
+from torch.nn.utils.rnn import pad_sequence
 
 class DotDict(dict):
     """dot.notation access to dictionary attributes"""
@@ -32,15 +37,22 @@ Sample = namedtuple('Sample', 'img bbox')
 def bbox_collate(batch):
     '''
     Storing a list of bbox to handle variable length.
-
-    Annoyingly, the pin_memory in the loader would destroy dotdict
-    and change it back to dict. Not sure how to solve this...
     '''
+    if torch.is_tensor(batch[0][0]):
+        return default_collate(batch)
+
     samples = [item[0] for item in batch]
     imgs = default_collate([item.img for item in samples])
 
     bboxes = [item.bbox for item in samples]
-    data = Sample(img=imgs, bbox=bboxes)
+    # pad the bboxes into xs, ys, ws, hs
+    data = {
+        'imgs': imgs,
+        'xs': pad_sequence([bbox.xs for bbox in bboxes], batch_first=True, padding_value=-1.),
+        'ys': pad_sequence([bbox.ys for bbox in bboxes], batch_first=True, padding_value=-1.),
+        'ws': pad_sequence([bbox.ws for bbox in bboxes], batch_first=True, padding_value=-1.),
+        'hs': pad_sequence([bbox.hs for bbox in bboxes], batch_first=True, padding_value=-1.),
+    }
 
     targets = default_collate([item[1] for item in batch])
     return [data, targets]
@@ -49,15 +61,9 @@ def bbox_collate(batch):
 class ImagenetBoundingBoxFolder(ImageFolder):
     ''' Custom loader that loads images with bounding box '''
 
-    def __init__(self, root, bbox_file, only_imgs_with_bbox=True, **kwargs):
+    def __init__(self, root, bbox_file, **kwargs):
         ''' bbox_file points to either `LOC_train_solution.csv` or `LOC_val_solution.csv` '''
         self.coord_dict = self.parse_coord_dict(bbox_file)
-        self.only_imgs_with_bbox = only_imgs_with_bbox
-
-        if only_imgs_with_bbox:
-            kwargs['is_valid_file'] = \
-                lambda path: os.path.basename(path) in self.coord_dict
-
         super().__init__(root, **kwargs)
 
     @staticmethod
@@ -88,7 +94,6 @@ class ImagenetBoundingBoxFolder(ImageFolder):
                     hs.append((int(y2) - int(y1)))
 
                 # Only take the first bounding box which is the ground truth
-                import numpy as np
                 coord_dict[filename] = DotDict(
                     xs=torch.LongTensor(xs),
                     ys=torch.LongTensor(ys),
@@ -131,29 +136,154 @@ class MyHackSampleSizeMixin(object):
     epoch-based training. So this hack is to return a dataset that
     has special length to make resulting loader run for an epoch.
     '''
-    def __init__(self, root, num_samples=None, **kwargs):
-        self.num_samples = num_samples
+    def __init__(self, root, my_num_samples=None, **kwargs):
+        self.my_num_samples = my_num_samples
         super().__init__(root, **kwargs)
 
     def __len__(self):
-        if self.num_samples is None:
+        if self.my_num_samples is None:
             return super().__len__()
 
-        return self.num_samples
+        return self.my_num_samples
 
     def __getitem__(self, index):
-        if self.num_samples is None:
+        if self.my_num_samples is None:
             return super().__getitem__(index)
 
         actual_len = super().__len__()
-        return super().__getitem__(index % actual_len)
+        get_item_func = super().__getitem__
+        if isinstance(index, list):
+            return [get_item_func(i % actual_len) for i in index]
+        return get_item_func(index % actual_len)
+
 
 class MyImageFolder(MyHackSampleSizeMixin, ImageFolder):
-    pass
+    def make_loader(self, batch_size, shuffle, workers):
+        return DataLoader(
+            self, batch_size=batch_size, shuffle=shuffle,
+            num_workers=workers, pin_memory=True, drop_last=False)
+
+    @property
+    def is_bbox_folder(self):
+        return False
+
 
 class MyImagenetBoundingBoxFolder(MyHackSampleSizeMixin, ImagenetBoundingBoxFolder):
-    pass
+    def make_loader(self, batch_size, shuffle, workers):
+        return DataLoader(
+            self, batch_size=batch_size // 2, shuffle=shuffle,
+            num_workers=workers, pin_memory=True, drop_last=False,
+            collate_fn=bbox_collate)
 
+    @property
+    def is_bbox_folder(self):
+        return True
+
+
+class MySubset(MyHackSampleSizeMixin, Subset):
+    def make_loader(self, batch_size, shuffle, workers):
+        the_dataset = self.dataset
+        while isinstance(the_dataset, MySubset):
+            the_dataset = the_dataset.dataset
+
+        return the_dataset.__class__.make_loader(
+            self, batch_size, shuffle, workers)
+
+    @property
+    def is_bbox_folder(self):
+        return self.dataset.is_bbox_folder
+
+
+class MyConcatDataset(MyHackSampleSizeMixin, ConcatDataset):
+    def make_loader(self, batch_size, shuffle, workers):
+        '''
+        Possibly 1 bbox folder and 1 img folder, or 2 img folders
+        '''
+        if np.all(self.is_bbox_folder): # all bbox folder
+            return MyImagenetBoundingBoxFolder.make_loader(
+                self, batch_size, shuffle, workers)
+
+        if not np.any(self.is_bbox_folder): # all img folder
+            return MyImageFolder.make_loader(
+                self, batch_size, shuffle, workers)
+
+        # 1 img folder and 1 bbox folder
+        sampler = MyConcatDatasetSampler(self, batch_size, shuffle=shuffle)
+        return DataLoader(
+            self, batch_size=None, sampler=sampler,
+            num_workers=workers, pin_memory=True, drop_last=False,
+            collate_fn=bbox_collate)
+
+    @property
+    def is_bbox_folder(self):
+        ''' return a list of bbox folder for its underlying datasets '''
+        return [d.is_bbox_folder for d in self.datasets]
+
+
+class MyImageNetODataset(MyConcatDataset):
+    '''
+    Generate an Imagenet-o dataset.
+    Idea is to combine two imagefolder datasets from the 2 directory.
+    Then set the images in the imagenet-o with target 1, and the val
+    imagenet images (w/ 200 classes) with target 0.
+    '''
+
+    def __init__(self, imageneto_dir, val_imgnet_dir, transform):
+        imageneto = MyImageFolder(imageneto_dir, transform=transform)
+        val_imgnet = MyImageFolder(val_imgnet_dir, transform=transform)
+
+        super().__init__([val_imgnet, imageneto])
+
+    def __getitem__(self, idx):
+        if idx < 0:
+            if -idx > len(self):
+                raise ValueError("absolute value of index should not exceed dataset length")
+            idx = len(self) + idx
+        dataset_idx = bisect.bisect_right(self.cumulative_sizes, idx)
+        if dataset_idx == 0:
+            sample_idx = idx
+        else:
+            sample_idx = idx - self.cumulative_sizes[dataset_idx - 1]
+
+        x, _ = self.datasets[dataset_idx][sample_idx]
+        y = dataset_idx # 0 means normal, 1 means outlier (imgnet-o)
+        return x, y
+
+
+class MyConcatDatasetSampler(Sampler):
+    '''
+    For each sub dataset, it loops through each dataset randomly with
+    batch size, but does not mix different dataset within a same batch
+    '''
+    def __init__(self, data_source, batch_size, shuffle=True):
+        assert isinstance(data_source, ConcatDataset), \
+            'Wrong data source with type ' + type(data_source)
+        self.data_source = data_source
+        self.batch_size = batch_size
+        self.batch_len = sum([
+            len(d) // (batch_size / 2 if d.is_bbox_folder else batch_size)
+            for d in self.data_source.datasets])
+        self.gen_func = torch.randperm if shuffle else torch.arange
+
+    def __iter__(self):
+        cs = self.data_source.cumulative_sizes
+
+        for s, e, dataset in zip([0] + cs[:-1], cs, self.data_source.datasets):
+            bs = self.batch_size // 2 \
+                if dataset.is_bbox_folder \
+                else self.batch_size
+            idxes = self.gen_func(e - s) + s
+
+            for s in range(0, len(idxes), bs):
+                yield idxes[s:(s + bs)].tolist()
+
+    def __len__(self):
+        return self.batch_len
+
+
+##################################################################
+###############      BBox transformations       ##################
+##################################################################
 class RandomCrop(tv.transforms.RandomCrop):
     def __call__(self, sample):
         img, bbox = sample.img, sample.bbox
@@ -286,16 +416,3 @@ class Normalize(tv.transforms.Normalize):
 
 # NIH dataset loader!!!
 # https://github.com/mlmed/torchxrayvision/blob/master/torchxrayvision/datasets.py#L867
-
-# train_tx = tv.transforms.Compose([
-#       tv.transforms.Resize((precrop, precrop)),
-#       tv.transforms.RandomCrop((crop, crop)),
-#       tv.transforms.RandomHorizontalFlip(),
-#       tv.transforms.ToTensor(),
-#       tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-#   ])
-#   val_tx = tv.transforms.Compose([
-#       tv.transforms.Resize((crop, crop)),
-#       tv.transforms.ToTensor(),
-#       tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-#   ])

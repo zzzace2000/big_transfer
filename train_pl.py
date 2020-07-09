@@ -22,6 +22,7 @@ import numpy as np
 import torchvision as tv
 import json
 import pandas as pd
+from sklearn.metrics import average_precision_score
 
 import bit_pytorch.fewshot as fs
 import bit_pytorch.lbtoolbox as lb
@@ -29,9 +30,9 @@ import bit_pytorch.models as models
 
 import bit_common
 import bit_hyperrule
-import models_utils
 import data_utils
-from data_utils import MyImagenetBoundingBoxFolder, bbox_collate, Sample, MyImageFolder
+from data_utils import MyImagenetBoundingBoxFolder, bbox_collate, Sample, \
+    MyImageFolder, MyConcatDataset, MyConcatDatasetSampler, MySubset, MyImageNetODataset
 from arch.Inpainting.Baseline import RandomColorWithNoiseInpainter, LocalMeanInpainter
 from arch.Inpainting.CAInpainter import CAInpainter
 
@@ -46,7 +47,6 @@ import torch.nn.functional as F
 import torch.nn.parallel
 import torch.utils.data
 import torch.utils.data.distributed
-import torchvision
 from pytorch_lightning.logging import TensorBoardLogger
 
 import pytorch_lightning as pl
@@ -69,28 +69,36 @@ class ImageNetLightningModel(LightningModule):
         super().__init__()
         self.hparams = hparams
         self.my_logger = bit_common.setup_logger(self.hparams)
-        # self.chrono = lb.Chrono()
 
-        n_train, n_classes, train_loader, val_loader = self.mktrainval()
-        # Use Bit-rule to select lr_schedules
-        # Then set the number to make the loader 1 epoch = max steps
+        train_set, valid_sets = self.make_train_val_dataset()
 
-        self.train_loader = train_loader
-        self.val_loader = val_loader
+        # setup the learning rate schedule for how long we want to train
+        self.lr_supports = bit_hyperrule.get_schedule(len(train_set))
+
+        # hack to make the pl train for 1 epoch = this number of steps
+        train_set.my_num_samples = (self.hparams.batch * self.lr_supports[-1])
+
+        batch_size = self.hparams.batch // self.hparams.batch_split
+        self.train_loader = train_set.make_loader(
+            batch_size, shuffle=True, workers=self.hparams.workers)
+        self.valid_loaders = [v.make_loader(
+            batch_size, shuffle=False, workers=self.hparams.workers)
+            for v in valid_sets]
 
         if hparams.model in models.KNOWN_MODELS:
             self.model = models.KNOWN_MODELS[hparams.model](
-                head_size=n_classes, zero_head=True)
+                head_size=len(valid_sets[0].classes), zero_head=True)
             if hparams.finetune:
                 self.my_logger.info("Fine-tuning from BiT")
                 self.model.load_from(np.load(f"models/{hparams.model}.npz"))
         else:  # from torchvision
-            self.model = getattr(torchvision.models, hparams.model)(
-                pretrained=hparams.finetune)
+            raise NotImplementedError()
+            # self.model = getattr(torchvision.models, hparams.model)(
+            #     pretrained=hparams.finetune)
 
         self.mixup = 0
         if hparams.use_mixup:
-            self.mixup = bit_hyperrule.get_mixup(n_train)
+            self.mixup = bit_hyperrule.get_mixup(len(train_set))
 
         self.inpaint_model = [self.get_inpainting_model()]
 
@@ -103,31 +111,25 @@ class ImageNetLightningModel(LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch
 
-        if not isinstance(x, Sample):
+        has_bbox = isinstance(x, dict)
+        if not has_bbox:
             criteron = F.cross_entropy
         else:
             criteron = self.counterfact_cri
 
-            bboxes = x.bbox
-            x = x.img
-
-            mask = x.new_ones(x.shape[0], 1, *x.shape[2:])
-            for i, bbox in enumerate(bboxes):
-                for coord_x, coord_y, w, h in zip(bbox.xs, bbox.ys, bbox.ws, bbox.hs):
+            mask = x['imgs'].new_ones(x['imgs'].shape[0], 1, *x['imgs'].shape[2:])
+            for i, (xs, ys, ws, hs) in enumerate(zip(x['xs'], x['ys'], x['ws'], x['hs'])):
+                for coord_x, coord_y, w, h in zip(xs, ys, ws, hs):
+                    if coord_x == -1:
+                        break
                     mask[i, 0, coord_y:(coord_y + h), coord_x:(coord_x + w)] = 0.
 
-            impute_x = self.inpaint_model[0](x, mask)
+            impute_x = self.inpaint_model[0](x['imgs'], mask)
             impute_y = (-y - 1)
 
-            x = torch.cat([x, impute_x], dim=0)
+            x = torch.cat([x['imgs'], impute_x], dim=0)
             # label -1 as negative of class 0, -2 as negative of class 1 etc...
             y = torch.cat([y, impute_y], dim=0)
-
-        # if self.use_dp:
-        #     print(x.device)
-        #     device = torch.device("cuda:0")
-        #     x = x.to(device, non_blocking=True)
-        #     y = y.to(device, non_blocking=True)
 
         mixup_l = np.random.beta(self.mixup, self.mixup) if self.mixup > 0 else 1
         if self.mixup > 0.0:
@@ -138,63 +140,107 @@ class ImageNetLightningModel(LightningModule):
             c = self.mixup_criterion(criteron, logits, y_a, y_b, mixup_l)
         else:
             c = criteron(logits, y)
-            # c_num = float(c.data.cpu().numpy())  # Also ensures a sync point.
 
-        # Accumulate grads
-        # with self.chrono.measure("grads"):
-        #     loss = (c / self.hparams.batch_split)
+        # See clean img accuracy and cf img accuracy
+        if not has_bbox:
+            acc1, acc5 = self.__accuracy(logits, y, topk=(1, 5))
+            cf_acc1, cf_acc5 = acc1.new_tensor(-1.), acc1.new_tensor(-1.)
+        else:
+            acc1, acc5 = self.__accuracy(logits[:(len(y)//2)], y[:(len(y)//2)], topk=(1, 5))
 
-        # step = self.global_step // self.hparams.batch_split
-        # accstep = f" ({self.global_step - step}/{self.hparams.batch_split})" if self.hparams.batch_split > 1 else ""
-        # lr = bit_hyperrule.get_lr(
-        #     step, base_lr=self.hparams.base_lr, supports=self.lr_supports)
-        # self.my_logger.info(
-        #     f"[step {step}{accstep}]: loss={c_num:.5f} (lr={lr:.1e})")  # pylint: disable=logging-format-interpolation
-        # self.my_logger.flush()
+            cf_y = -(y[(len(y)//2):] + 1)
+            cf_acc1, cf_acc5 = self.__accuracy(
+                logits[(len(y)//2):], cf_y, topk=(1, 5))
+            cf_acc1, cf_acc5 = 100. - cf_acc1, 100. - cf_acc5
 
-        acc1, acc5 = self.__accuracy(logits, y, topk=(1, 5))
-
-        tqdm_dict = {'train_loss': c}
+        tqdm_dict = {'train_loss': c, 'train_acc1': acc1, 'train_acc5': acc5,
+                     **({} if not has_bbox
+                        else {'train_cf_acc1': cf_acc1, 'train_cf_acc5': cf_acc5})}
         output = OrderedDict({
             'loss': c,
             'acc1': acc1,
             'acc5': acc5,
+            'cf_acc1': cf_acc1,
+            'cf_acc5': cf_acc5,
             'progress_bar': tqdm_dict,
-            'log': tqdm_dict
-        })
-
-        return output
-
-    # def on_train_end(self):
-    #     self.my_logger.info(f"Timings:\n{self.chrono}")
-
-    def validation_step(self, batch, batch_idx):
-        images, target = batch
-
-        output = self(images)
-        loss_val = F.cross_entropy(output, target, reduction='sum')
-        acc1, acc5 = self.__accuracy(output, target, topk=(1, 5))
-        batch_size = images.new_tensor(images.shape[0])
-
-        output = OrderedDict({
-            'val_loss': loss_val,
-            'val_acc1': acc1 * batch_size,
-            'val_acc5': acc5 * batch_size,
-            'batch_size': batch_size,
+            'log': tqdm_dict,
         })
         return output
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=None):
+        if dataloader_idx is None or dataloader_idx == 0:
+            images, target = batch
+
+            output = self(images)
+            loss_val = F.cross_entropy(output, target, reduction='sum')
+            acc1, acc5 = self.__accuracy(output, target, topk=(1, 5))
+            batch_size = images.new_tensor(images.shape[0])
+
+            output = OrderedDict({
+                'val_loss': loss_val,
+                'val_acc1': acc1 * batch_size,
+                'val_acc5': acc5 * batch_size,
+                'batch_size': batch_size,
+            })
+            return output
+
+        # handle the second loader for part of the train loader
+        # since counting cf size is annoying, just take avg
+        if dataloader_idx == 1:
+            result = self.training_step(batch, batch_idx)
+            output = OrderedDict({
+                'val_loss': result['loss'],
+                'val_acc1': result['acc1'],
+                'val_acc5': result['acc5'],
+                'val_cf_acc1': result['cf_acc1'],
+                'val_cf_acc5': result['cf_acc5'],
+            })
+            return output
+
+        # for imagenet-o
+        if dataloader_idx == 2:
+            x, y = batch
+            logits = self(x)
+            anomaly_score = -(logits.max(dim=1).values)
+
+            output = OrderedDict({
+                'as': anomaly_score,
+                'y': y,
+            })
+            return output
 
     def validation_epoch_end(self, outputs):
         tqdm_dict = {}
 
-        all_size = torch.stack([o['batch_size'] for o in outputs]).sum()
+        # 1st val loader
+        the_outputs = outputs if isinstance(outputs[0], dict) else outputs[0]
+        all_size = torch.stack([o['batch_size'] for o in the_outputs]).sum()
         for metric_name in ["val_loss", "val_acc1", "val_acc5"]:
-            metrics = [o[metric_name] for o in outputs]
+            metrics = [o[metric_name] for o in the_outputs]
             tqdm_dict[metric_name] = torch.sum(torch.stack(metrics)) / all_size
+
+        # 2nd val loader
+        if isinstance(outputs[0], list) and len(outputs) > 1:
+            the_outputs = outputs[1]
+            for metric_name in ["val_loss", "val_acc1", "val_acc5",
+                                "val_cf_acc1", "val_cf_acc5"]:
+                metrics = [o[metric_name] for o in the_outputs]
+                metrics = torch.stack(metrics)
+                metrics = metrics[metrics >= 0.] # filter out neg value
+                tqdm_dict[metric_name + '_train'] = metrics.mean()
+
+        # 3rd val loader
+        if isinstance(outputs[0], list) and len(outputs) > 2:
+            the_outputs = outputs[2]
+            anomaly_scores = torch.cat([o['as'] for o in the_outputs])
+            ys = torch.cat([o['y'] for o in the_outputs])
+
+            tqdm_dict['imgneto_aupr'] = average_precision_score(
+                ys.cpu().numpy(), anomaly_scores.cpu().numpy())
 
         result = {
             'progress_bar': tqdm_dict, 'log': tqdm_dict, 'val_loss': tqdm_dict["val_loss"],
-            'step': self.global_step, # for checkpoint filename
+            'gstep': self.global_step // self.hparams.batch_split, # for checkpoint filename
         }
         return result
 
@@ -219,10 +265,13 @@ class ImageNetLightningModel(LightningModule):
         optimizer = torch.optim.SGD(
             self.model.parameters(), lr=1., momentum=0.9)
         scheduler = {
-            # subtle: it only calls scheudler every {num_GPU} steps
+            # subtle: for lightning 0.7.x, the global step does not count the
+            # accumulate_grad_batches. But after 0.8.x, the global step do count those.
             'scheduler': torch.optim.lr_scheduler.LambdaLR(
                 optimizer, lr_lambda=lambda step: bit_hyperrule.get_lr(
-                    self.global_step, base_lr=self.hparams.base_lr, supports=self.lr_supports)),
+                    self.global_step // self.hparams.batch_split,
+                    base_lr=self.hparams.base_lr,
+                    supports=self.lr_supports)),
             'interval': 'step',
         }
         return [optimizer], [scheduler]
@@ -250,25 +299,11 @@ class ImageNetLightningModel(LightningModule):
         loss2 = -(num - denon).sum()
         return (loss1 + loss2) / y.shape[0]
 
-    # def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx,
-    #                    second_order_closure=None):
-    #     # Update learning-rate, including stop training if over.
-    #     step = self.global_step // self.hparams.batch_split
-    #     lr = bit_hyperrule.get_lr(
-    #         step, base_lr=self.hparams.base_lr, supports=self.lr_supports)
-    #     for param_group in optimizer.param_groups:
-    #         param_group["lr"] = lr
-    #
-    #     if self.global_step - step == (self.hparams.batch_split - 1):
-    #         with self.chrono.measure("update"):
-    #             optimizer.step()
-    #             optimizer.zero_grad()
-
     def train_dataloader(self):
         return self.train_loader
 
     def val_dataloader(self):
-        return self.val_loader
+        return self.valid_loaders
 
     @staticmethod
     def mixup_data(x, y, l):
@@ -283,45 +318,7 @@ class ImageNetLightningModel(LightningModule):
     def mixup_criterion(criterion, pred, y_a, y_b, l):
         return l * criterion(pred, y_a) + (1 - l) * criterion(pred, y_b)
 
-    def mktrainval(self):
-        if self.hparams.dataset not in ['objectnet', 'imageneta'] or self.hparams.inpaint == 'none':
-            return self._mktrainval()
-        else:
-            self.my_logger.info(f"Composing 2 loaders for {self.hparams.dataset} w/ inpaint {self.hparams.inpaint}")
-            # Compose 2 loaders: 1 w/ inpaint as true and dataset == 'objectnet_bbox'
-            # The other would be having 1 w/ inpaint == 'none' and dataset == 'objectnet_no_bbox'
-            orig_inpaint = self.hparams.inpaint
-            orig_dataset = self.hparams.dataset
-
-            self.hparams.dataset = f'{orig_dataset}_bbox'
-            f_n_train, n_classes, f_train_loader, valid_loader = \
-                self.mktrainval()
-            self.hparams.dataset = f'{orig_dataset}_no_bbox'
-            self.hparams.inpaint = 'none'
-            s_n_train, _, s_train_loader, _ = self.mktrainval()
-
-            n_train = f_n_train + s_n_train
-
-            def composed_train_loader():
-                loaders = [f_train_loader, s_train_loader]
-                order = np.random.randint(low=0, high=2)
-                for s in loaders[order]:
-                    yield s
-                self.my_logger.info(f"Finish the {order} loader. (0 means bbox, 1 means no bbox)")
-                for s in loaders[1 - order]:
-                    yield s
-                self.my_logger.info(f"Finish the {1 - order} loader. (0 means bbox, 1 means no bbox)")
-
-            train_loader = composed_train_loader()
-
-            # Set everything back
-            self.hparams.dataset = orig_dataset
-            self.hparams.inpaint = orig_inpaint
-            self.my_logger.info(f"Using a total training set {n_train} images")
-            return n_train, n_classes, train_loader, valid_loader
-
-    def _mktrainval(self):
-        """Returns train and validation datasets."""
+    def make_train_val_dataset(self):
         precrop, crop = bit_hyperrule.get_resolution_from_dataset(self.hparams.dataset)
         if self.hparams.test_run:  # save memory
             precrop, crop = 64, 56
@@ -339,106 +336,103 @@ class ImageNetLightningModel(LightningModule):
             tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ])
 
-        collate_fn = None
-        n_train = None
-        micro_batch_size = self.hparams.batch // self.hparams.batch_split
-        if self.use_ddp: # see
-            micro_batch_size //= (torch.cuda.device_count())
+        def sub_dataset(bbox_dataset, subset_data):
+            if subset_data == 0.:
+                return bbox_dataset
 
-        if self.hparams.dataset == "cifar10":
-            train_set = tv.datasets.CIFAR10(self.hparams.datadir, transform=train_tx, train=True, download=True)
-            valid_set = tv.datasets.CIFAR10(self.hparams.datadir, transform=val_tx, train=False, download=True)
-        elif self.hparams.dataset == "cifar100":
-            train_set = tv.datasets.CIFAR100(self.hparams.datadir, transform=train_tx, train=True, download=True)
-            valid_set = tv.datasets.CIFAR100(self.hparams.datadir, transform=val_tx, train=False, download=True)
-        elif self.hparams.dataset == "imagenet2012":
+            num = int(subset_data)
+            if subset_data <= 1.:
+                num = int(len(bbox_dataset) * subset_data)
+
+            indices = torch.randperm(len(bbox_dataset))[:num]
+            bbox_dataset = MySubset(bbox_dataset, indices=indices)
+            return bbox_dataset
+
+        if self.hparams.dataset == "imagenet2012":
             train_set = MyImageFolder(pjoin(self.hparams.datadir, "train"), transform=train_tx)
-            valid_set = MyImageFolder(pjoin(self.hparams.datadir, "val"), transform=val_tx)
-        elif self.hparams.dataset.startswith('objectnet') or self.hparams.dataset.startswith(
-                'imageneta'):  # objectnet and objectnet_bbox and objectnet_no_bbox
-            identifier = 'objectnet' if self.hparams.dataset.startswith('objectnet') else 'imageneta'
-            valid_set = MyImageFolder(f"../datasets/{identifier}/", transform=val_tx)
-
-            if self.hparams.inpaint == 'none':
-                if self.hparams.dataset == 'objectnet' or self.hparams.dataset == 'imageneta':
-                    train_set = MyImageFolder(pjoin(self.hparams.datadir, f"train_{self.hparams.dataset}"),
-                                                        transform=train_tx)
-                else:  # For only images with or w/o bounding box
-                    train_bbox_file = '../datasets/imagenet/LOC_train_solution_size.csv'
-                    df = pd.read_csv(train_bbox_file)
-                    filenames = set(df[df.bbox_ratio <= self.hparams.bbox_max_ratio].ImageId)
-                    if self.hparams.dataset == f"{identifier}_no_bbox":
-                        is_valid_file = lambda path: os.path.basename(path).split('.')[0] not in filenames
-                    elif self.hparams.dataset == f"{identifier}_bbox":
-                        is_valid_file = lambda path: os.path.basename(path).split('.')[0] in filenames
-                    else:
-                        raise NotImplementedError()
-
-                    train_set = MyImageFolder(
-                        pjoin(self.hparams.datadir, f"train_{identifier}"),
-                        is_valid_file=is_valid_file,
-                        transform=train_tx)
-            else:  # do inpainting
-                train_tx = tv.transforms.Compose([
-                    data_utils.Resize((precrop, precrop)),
-                    data_utils.RandomCrop((crop, crop)),
-                    data_utils.RandomHorizontalFlip(),
-                    data_utils.ToTensor(),
-                    data_utils.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-                ])
-
-                train_set = MyImagenetBoundingBoxFolder(
-                    root=f"../datasets/imagenet/train_{identifier}",
-                    bbox_file='../datasets/imagenet/LOC_train_solution.csv',
+            valid_sets = [MyImageFolder(pjoin(self.hparams.datadir, "val"), transform=val_tx)]
+        elif self.hparams.dataset in ['objectnet', 'imageneta']:
+            if self.hparams.bbox_data == 1. \
+                    and self.hparams.nobbox_data == 1. \
+                    and self.inpaint == 'none':
+                train_set = MyImageFolder(
+                    pjoin(self.hparams.datadir, f"train_{self.hparams.dataset}"),
                     transform=train_tx)
-                collate_fn = bbox_collate
-                n_train = len(train_set) * 2
-                micro_batch_size //= 2
+            else:
+                df = pd.read_csv(pjoin(self.hparams.datadir, 'LOC_train_solution_size.csv'))
+                bbox_filenames = set(df.ImageId)
+
+                def has_bbox(path):
+                    return os.path.basename(path).split('.')[0] in bbox_filenames
+
+                ret_datasets = []
+                # handle no bbox dataset
+                if self.hparams.nobbox_data > 0.:
+                    nobbox_d = MyImageFolder(
+                        pjoin(self.hparams.datadir, f"train_{self.hparams.dataset}"),
+                        is_valid_file=lambda path: ~has_bbox(path),
+                        transform=train_tx)
+                    nobbox_d = sub_dataset(nobbox_d, self.hparams.nobbox_data)
+                    ret_datasets.append(nobbox_d)
+
+                # handle bbox dataset
+                if self.hparams.bbox_data > 0.:
+                    if self.hparams.inpaint == 'none':
+                        bbox_d = MyImageFolder(
+                            pjoin(self.hparams.datadir, f"train_{self.hparams.dataset}"),
+                            is_valid_file=has_bbox,
+                            transform=train_tx)
+                    else:
+                        train_tx = tv.transforms.Compose([
+                            data_utils.Resize((precrop, precrop)),
+                            data_utils.RandomCrop((crop, crop)),
+                            data_utils.RandomHorizontalFlip(),
+                            data_utils.ToTensor(),
+                            data_utils.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                        ])
+                        bbox_d = MyImagenetBoundingBoxFolder(
+                            pjoin(self.hparams.datadir, f"train_{self.hparams.dataset}"),
+                            bbox_file=pjoin(self.hparams.datadir, 'LOC_train_solution.csv'),
+                            is_valid_file=has_bbox,
+                            transform=train_tx)
+                    bbox_d = sub_dataset(bbox_d, self.hparams.bbox_data)
+                    ret_datasets.insert(0, bbox_d) # training bbox data first to easily debug
+
+                train_set = ret_datasets[0] if len(ret_datasets) == 1 \
+                    else MyConcatDataset(ret_datasets)
+
+            valid_sets = [MyImageFolder(f"../datasets/{self.hparams.dataset}/", transform=val_tx)]
+
+            if self.hparams.val_data > 0.:
+                num = int(self.hparams.val_data)
+                if self.hparams.val_data <= 1.:
+                    num = int(len(train_set) * self.hparams.val_data)
+                shuffled_indices = torch.randperm(len(train_set))
+                valid_set2 = MySubset(train_set, indices=shuffled_indices[:num])
+                train_set = MySubset(train_set, indices=shuffled_indices[num:])
+
+                valid_sets.append(valid_set2)
+
+            if self.hparams.dataset == 'imageneta': # add an imagenet-o OOD val loader
+                valid_set3 = MyImageNetODataset(
+                    imageneto_dir="../datasets/imageneto/",
+                    val_imgnet_dir="../datasets/imagenet/val_imageneta/",
+                    transform=val_tx)
+                valid_sets.append(valid_set3)
+
         else:
             raise ValueError(f"Sorry, we have not spent time implementing the "
                              f"{self.hparams.dataset} dataset in the PyTorch codebase. "
                              f"In principle, it should be easy to add :)")
 
-        if self.hparams.examples_per_class is not None:
-            self.my_logger.info(f"Looking for {self.hparams.examples_per_class} images per class...")
-            indices = fs.find_fewshot_indices(train_set, self.hparams.examples_per_class)
-            train_set = torch.utils.data.Subset(train_set, indices=indices)
-
         self.my_logger.info(f"Using a training set with {len(train_set)} images.")
-        self.my_logger.info(f"Using a validation set with {len(valid_set)} images.")
-
-        valid_loader = torch.utils.data.DataLoader(
-            valid_set, batch_size=micro_batch_size, shuffle=False,
-            num_workers=self.hparams.workers, pin_memory=True, drop_last=False)
-
-        if n_train is None:
-            n_train = len(train_set)
-        self.lr_supports = bit_hyperrule.get_schedule(n_train)
-        ## hack to make the pl train for 1 epoch
-        train_set.num_samples = (self.hparams.batch * self.lr_supports[-1])
-
-        if micro_batch_size <= len(train_set):
-            train_loader = torch.utils.data.DataLoader(
-                train_set, batch_size=micro_batch_size, shuffle=True,
-                num_workers=self.hparams.workers, pin_memory=True, drop_last=False,
-                collate_fn=collate_fn)
-        else:
-            # In the few-shot cases, the total dataset size might be smaller than the batch-size.
-            # In these cases, the default sampler doesn't repeat, so we need to make it do that
-            # if we want to match the behaviour from the paper.
-            train_loader = torch.utils.data.DataLoader(
-                train_set, batch_size=micro_batch_size, num_workers=self.hparams.workers,
-                pin_memory=True,
-                sampler=torch.utils.data.RandomSampler(train_set, replacement=True, num_samples=micro_batch_size),
-                collate_fn=collate_fn)
-
-        return n_train, len(valid_set.classes), train_loader, valid_loader
+        for idx, v in enumerate(valid_sets):
+            self.my_logger.info(f"Using a validation set {idx} with {len(v)} images.")
+        return train_set, valid_sets
 
     @staticmethod
     def add_model_specific_args(parent_parser):  # pragma: no-cover
         return parent_parser
-        # parser = ArgumentParser(parents=[parent_parser])
-        # return parser
 
     def get_inpainting_model(self):
         if self.hparams.inpaint == 'none':
@@ -458,28 +452,6 @@ class ImageNetLightningModel(LightningModule):
 
         return inpaint_model
 
-    # def my_load_model(self):
-    #     try:
-    #         logger.info(f"Model will be saved in '{savename}'")
-    #         checkpoint = torch.load(savename, map_location="cpu")
-    #         logger.info(f"Found saved model to resume from at '{savename}'")
-    #
-    #         step = checkpoint["step"]
-    #         model.load_state_dict(checkpoint["model"])
-    #         model = model.to(device)
-    #
-    #         # Note: no weight-decay!
-    #         optim = torch.optim.SGD(model.parameters(), lr=0.003, momentum=0.9)
-    #         optim.load_state_dict(checkpoint["optim"])
-    #         logger.info(f"Resumed at step {step}")
-    #     except FileNotFoundError:
-    #         if args.finetune:
-    #             logger.info("Fine-tuning from BiT")
-    #             model.load_from(np.load(f"models/{args.model}.npz"))
-    #
-    #         model = model.to(device)
-    #         optim = torch.optim.SGD(model.parameters(), lr=0.003, momentum=0.9)
-
 
 def get_args():
     # Big Transfer arg parser
@@ -497,16 +469,11 @@ def get_args():
                         help="Where to log training info (small).")
     parser.add_argument('--seed', type=int, default=None,
                         help='seed for initializing training. ')
-    parser.add_argument("--dataset", choices=list(bit_hyperrule.known_dataset_sizes.keys()),
-                        default='objectnet_bbox',
-                        help="Choose the dataset. It should be easy to add your own! "
-                             "Don't forget to set --datadir if necessary.")
     parser.add_argument("--examples_per_class", type=int, default=None,
                         help="For the few-shot variant, use this many examples "
                              "per class only.")
     parser.add_argument("--examples_per_class_seed", type=int, default=0,
                         help="Random seed for selecting examples.")
-
     parser.add_argument("--batch", type=int, default=512,
                         help="Batch size.")
     parser.add_argument("--batch_split", type=int, default=1,
@@ -516,18 +483,23 @@ def get_args():
     parser.add_argument("--eval_every", type=int, default=500,
                         help="Run prediction on validation set every so many steps."
                              "Will always run one evaluation at the end of training.")
-
-    parser.add_argument("--datadir", default='../datasets/imagenet',
-                        help="Path to the ImageNet data folder, preprocessed for torchvision.")
     parser.add_argument("--workers", type=int, default=8,
                         help="Number of background threads used to load data.")
 
     # My own arguments
-    parser.add_argument("--inpaint", type=str, default='none',
+    parser.add_argument("--dataset", choices=list(bit_hyperrule.known_dataset_sizes.keys()),
+                        default='imageneta',
+                        help="Choose the dataset. It should be easy to add your own! "
+                             "Don't forget to set --datadir if necessary.")
+    parser.add_argument("--datadir", default='../datasets/imagenet',
+                        help="Path to the ImageNet data folder, preprocessed for torchvision.")
+    parser.add_argument("--bbox_data", type=float, default=1.0)
+    parser.add_argument("--nobbox_data", type=float, default=0.)
+    parser.add_argument("--val_data", type=float, default=1000)
+    parser.add_argument("--inpaint", type=str, default='mean',
                         choices=['mean', 'random', 'local',
                                  'cagan', 'none'])
-    parser.add_argument("--bbox_subsample_ratio", type=float, default=1)
-    parser.add_argument("--bbox_max_ratio", type=float, default=0.5)
+    # parser.add_argument("--bbox_max_ratio", type=float, default=1.)
     parser.add_argument("--use_mixup", type=int, default=0)  # Turn off mixup for now
     parser.add_argument("--test_run", type=int, default=1)
     parser.add_argument("--fp16", type=int, default=1)
@@ -557,7 +529,7 @@ def main(args: Namespace) -> None:
         cudnn.deterministic = True
 
     checkpoint_callback = ModelCheckpoint(
-        filepath=pjoin(args.logdir, args.name, '{step}'),
+        filepath=pjoin(args.logdir, args.name, '{gstep}'),
         save_top_k=-1,
         period=-1, # a hack to save checkpts within an epoch
         verbose=True,

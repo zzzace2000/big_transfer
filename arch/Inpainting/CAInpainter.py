@@ -115,6 +115,7 @@ class CAInpainter(object):
         pth_img = np.moveaxis(tf_images, 3, 1)
         pth_img = ((pth_img / 255.) - self.pth_mean) / self.pth_std
 
+        pth_img = torch.from_numpy(pth_img)
         pth_img = pth_img.to(pytorch_image.device)
         pth_img = F.interpolate(pth_img, size=orig_size, mode='bilinear').data
 
