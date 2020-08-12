@@ -24,6 +24,20 @@ class MeanInpainter(InpaintTemplate):
         return x.new(x.shape).zero_()
 
 
+class ShuffleInpainter(InpaintTemplate):
+    '''
+    Just put 0 to impute. (As grey in Imagenet)
+    '''
+    def impute_missing_imgs(self, x, mask):
+        background = self.generate_background(x, mask)
+        return x * mask + background * (1. - mask)
+
+    def generate_background(self, x, mask):
+        idx = torch.randperm(x.nelement()).to(x.device)
+        t = x.reshape(-1)[idx].reshape(x.size())
+        return t
+
+
 class LocalMeanInpainter(InpaintTemplate):
     def __init__(self, window=15):
         super(LocalMeanInpainter, self).__init__()
@@ -50,22 +64,12 @@ class LocalMeanInpainter(InpaintTemplate):
 
 
 class BlurryInpainter(InpaintTemplate):
-    def __init__(self):
-        super(BlurryInpainter, self).__init__()
-        self.blurred_img = None
-
-    def reset(self):
-        self.blurred_img = None
-
     def impute_missing_imgs(self, x, mask):
         backgnd = self.generate_background(x, mask)
         return x * mask + backgnd * (1. - mask)
 
     def generate_background(self, x, mask):
-        if self.blurred_img is None:
-            self.blurred_img = self.blur_pytorch_img(x[0])
-            self.blurred_img = self.blurred_img.unsqueeze(0)
-        return self.blurred_img
+        return self.blur_pytorch_img(x[0]).unsqueeze_(0)
 
     @staticmethod
     def blur_pytorch_img(pytorch_img):
@@ -81,7 +85,7 @@ class BlurryInpainter(InpaintTemplate):
 
 
 class RandomColorWithNoiseInpainter(InpaintTemplate):
-    def __init__(self, color_mean=(0.485, 0.456, 0.406), color_std=(0.229, 0.224, 0.225)):
+    def __init__(self, color_mean=(0.5,), color_std=(0.5,)):
         super(RandomColorWithNoiseInpainter, self).__init__()
         self.color_mean = color_mean
         self.color_std = color_std
@@ -91,10 +95,10 @@ class RandomColorWithNoiseInpainter(InpaintTemplate):
         return x * mask + background * (1. - mask)
 
     def generate_background(self, x, mask):
-        random_img = x.new(x.size(0), 3, 1, 1).uniform_().repeat(1, 1, x.size(2), x.size(3))
+        random_img = x.new(x.size(0), x.size(1), 1, 1).uniform_().repeat(1, 1, x.size(2), x.size(3))
         random_img += x.new(*x.size()).normal_(0, 0.2)
         random_img.clamp_(0., 1.)
 
-        for c in [0, 1, 2]:
+        for c in range(x.size(1)):
             random_img[:, c, :, :].sub_(self.color_mean[c]).div_(self.color_std[c])
         return random_img

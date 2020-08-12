@@ -81,10 +81,10 @@ class VAEInpainter(torch.nn.Module):
 
     @staticmethod
     def reparametrize(mu, logvar):
-        std = logvar.mul(0.5).exp_()
+        std = logvar.mul(0.5).exp()
 
         eps = std.data.new(std.size()).normal_()
-        return eps.mul(std).add_(mu)
+        return eps.mul_(std).add_(mu)
 
     @staticmethod
     def decouple(params, channel_num=None):
@@ -95,39 +95,40 @@ class VAEInpainter(torch.nn.Module):
         logvar = params[:, channel_num:, :, :]
         return mu, logvar
 
-    def forward(self, x, mask):
-        if self.in_mean is not None:
-            x = x.clone()
-            for i, (m, s, tm, ts) in enumerate(zip(
-                    self.in_mean, self.in_std, self.training_mean, self.training_std)):
-                x[:, i, :, :].mul_(s).add_(m - tm).div_(ts)
+    def forward(self, imgs, mask):
+        with torch.no_grad():
+            x = imgs.clone()
+            if self.in_mean is not None:
+                for i, (m, s, tm, ts) in enumerate(zip(
+                        self.in_mean, self.in_std, self.training_mean, self.training_std)):
+                    x[:, i, :, :].mul_(s).add_(m - tm).div_(ts)
 
-        orig_size = x.shape[2:]
-        x = torch.cat((x.mul_(mask), 1. - mask), dim=1)
+            orig_size = x.shape[2:]
+            x = torch.cat((x.mul_(mask), 1. - mask), dim=1)
 
-        if orig_size[0] != 224 or orig_size[1] != 224:
-            x = self.in_transform(x)
-            x[:, 3, :, :].round_()
+            if orig_size[0] != 224 or orig_size[1] != 224:
+                x = self.in_transform(x)
+                x[:, 3, :, :].round_()
 
-        z_params = self.encode(x)
-        mu, logvar = self.decouple(z_params)
+            z_params = self.encode(x)
+            mu, logvar = self.decouple(z_params)
 
-        z = self.reparametrize(mu, logvar)
+            z = self.reparametrize(mu, logvar)
 
-        x_params = self.decode(z)
-        recon_x, _ = self.decouple(x_params)
+            x_params = self.decode(z)
+            recon_x, _ = self.decouple(x_params)
 
-        # clipping the maximum value to be in the range
-        for c, (tm, ts) in enumerate(zip(self.training_mean, self.training_std)):
-            recon_x[:, c, :, :].clamp_(min=(0. - tm) / ts, max=(1. - tm) / ts)
+            # clipping the maximum value to be in the range
+            for c, (tm, ts) in enumerate(zip(self.training_mean, self.training_std)):
+                recon_x[:, c, :, :].clamp_(min=(0. - tm) / ts, max=(1. - tm) / ts)
 
-        if self.in_mean is not None:
-            for i, (m, s, tm, ts) in enumerate(zip(
-                    self.in_mean, self.in_std, self.training_mean, self.training_std)):
-                recon_x[:, i, :, :].mul_(ts).add_(tm-m).div_(s)
+            if self.in_mean is not None:
+                for i, (m, s, tm, ts) in enumerate(zip(
+                        self.in_mean, self.in_std, self.training_mean, self.training_std)):
+                    recon_x[:, i, :, :].mul_(ts).add_(tm-m).div_(s)
 
-        # clipping
-        if orig_size[0] != 224 or orig_size[1] != 224:
-            recon_x = F.interpolate(recon_x, size=orig_size, mode='bilinear').data
+            # resize back
+            if orig_size[0] != 224 or orig_size[1] != 224:
+                recon_x = F.interpolate(recon_x, size=orig_size, mode='bilinear').data
 
-        return recon_x
+            return (imgs * mask) + (recon_x * (1. - mask))

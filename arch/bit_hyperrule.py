@@ -44,9 +44,10 @@ def get_mixup(dataset_size):
 
 
 def get_schedule(dataset_size):
-  if dataset_size < 20_000:
-    return [100, 200, 300, 400, 500]
-  elif dataset_size < 500_000:
+  # return [5, 30, 60, 90, 10_0]
+  # if dataset_size < 20_000:
+  #   return [100, 200, 300, 400, 500]
+  if dataset_size < 500_000:
     return [500, 3000, 6000, 9000, 10_000]
   else:
     return [500, 6000, 12_000, 18_000, 20_000]
@@ -56,13 +57,13 @@ def get_lr(step, dataset_size=None, base_lr=0.003, supports=None):
   """Returns learning-rate for `step` or None at the end."""
   if supports is None:
     supports = get_schedule(dataset_size)
-  # Linear warmup
+  # Linear warmupm
   if step < supports[0]:
     lr = base_lr * (step+1) / supports[0]
     # print(f"Return lr {lr} in step {step}")
     return lr
   # End of training
-  elif step >= supports[-1]:
+  elif step > supports[-1]:
     return None
   # Staircase decays by factor of 10
   else:

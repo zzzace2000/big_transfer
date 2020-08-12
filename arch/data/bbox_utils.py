@@ -15,6 +15,34 @@ import bisect
 from torch.nn.utils.rnn import pad_sequence
 
 
+def bbox_collate(batch):
+    '''
+    Padding the bounding box in the collate function
+    '''
+    if torch.is_tensor(batch[0][0]):
+        return default_collate(batch)
+    if isinstance(batch[0][0], dict) and 'xs' not in batch[0][0]:
+        return default_collate(batch)
+    if batch[0][0].xs.ndim == 0:
+        return default_collate(batch)
+
+    samples = [item[0] for item in batch]
+    # pad the bboxes into xs, ys, ws, hs
+    data = {
+        'xs': pad_sequence([sample.xs for sample in samples], batch_first=True, padding_value=-1.),
+        'ys': pad_sequence([sample.ys for sample in samples], batch_first=True, padding_value=-1.),
+        'ws': pad_sequence([sample.ws for sample in samples], batch_first=True, padding_value=-1.),
+        'hs': pad_sequence([sample.hs for sample in samples], batch_first=True, padding_value=-1.),
+    }
+
+    data['imgs'] = default_collate([item['imgs'] for item in samples])
+    if 'imgs_cf' in samples[0]:
+        data['imgs_cf'] = default_collate([item['imgs_cf'] for item in samples])
+
+    targets = default_collate([item[1] for item in batch])
+    return [data, targets]
+
+
 ##################################################################
 ###############      BBox transformations       ##################
 ##################################################################
@@ -22,22 +50,20 @@ class RandomCrop(tv.transforms.RandomCrop):
     def __call__(self, sample):
         img = sample.imgs
 
-        if self.padding is not None:
-            img = F.pad(img, self.padding, self.fill, self.padding_mode)
+        if 'xs' not in sample or (sample.xs < 0.).all():
+            i, j, h, w = self.get_params(img, self.size)
+            sample.imgs = F.crop(img, i, j, h, w)
+            return sample
 
-        # pad the width if needed
-        if self.pad_if_needed and img.size[0] < self.size[1]:
-            img = F.pad(img, (self.size[1] - img.size[0], 0), self.fill, self.padding_mode)
-        # pad the height if needed
-        if self.pad_if_needed and img.size[1] < self.size[0]:
-            img = F.pad(img, (0, self.size[0] - img.size[1]), self.fill, self.padding_mode)
-
-        low_i = (sample.ys - self.size[0]).clamp_(0).min().item()
-        low_j = (sample.xs - self.size[1]).clamp_(0).min().item()
+        low_i = (sample.ys - self.size[0] + 1).clamp_(0).min().item()
+        low_j = (sample.xs - self.size[1] + 1).clamp_(0).min().item()
+        max_i = (sample.ys + sample.hs - 1).max().item()
+        max_j = (sample.xs + sample.ws - 1).max().item()
 
         # It has to contain at least 1 bounding box!
         while True:
-            i, j, h, w = self.get_params(img, self.size, low_i=low_i, low_j=low_j)
+            i, j, h, w = self.get_params(img, self.size, low_i=low_i, low_j=low_j,
+                                         max_i=max_i, max_j=max_j)
             if 'xs' not in sample or (sample.xs < 0.).all():
                 sample.imgs = F.crop(img, i, j, h, w)
                 return sample
@@ -65,7 +91,7 @@ class RandomCrop(tv.transforms.RandomCrop):
         return sample
 
     @staticmethod
-    def get_params(img, output_size, low_i=0, low_j=0):
+    def get_params(img, output_size, low_i=0, low_j=0, max_i=np.inf, max_j=np.inf):
         """Get parameters for ``crop`` for a random crop.
 
         Args:
@@ -80,8 +106,8 @@ class RandomCrop(tv.transforms.RandomCrop):
         if w == tw and h == th:
             return 0, 0, h, w
 
-        i = random.randint(low_i, h - th)
-        j = random.randint(low_j, w - tw)
+        i = random.randint(low_i, min(max_i, h - th))
+        j = random.randint(low_j, min(max_j, w - tw))
         return i, j, th, tw
 
 
@@ -130,19 +156,34 @@ class Resize(tv.transforms.Resize):
         if 'xs' not in sample or (sample.xs < 0.).all():
             return sample
 
-        # has_bbox = (sample.xs >= 0)
         new_h, new_w = sample.imgs.height, sample.imgs.width
+        sample.xs, sample.ys, sample.ws, sample.hs = self.resize_bbox(
+            w, h, new_w, new_h,
+            sample.xs, sample.ys, sample.ws, sample.hs)
 
-        old_xs, old_ys = sample.xs.clone(), sample.ys.clone()
-        sample.xs.mul_(new_w).floor_divide_(w)
-        sample.ys.mul_(new_h).floor_divide_(h)
-        # To be exact for w and h, we calculate the post-coordinate
-        # and round the coordinate to get width / height.
-        sample.ws.add_(old_xs).mul_(new_w).floor_divide_(w).add_(1).sub_(sample.xs)
-        sample.hs.add_(old_ys).mul_(new_h).floor_divide_(h).add_(1).sub_(sample.ys)
+        # has_bbox = (sample.xs >= 0)
+        # new_h, new_w = sample.imgs.height, sample.imgs.width
+        #
+        # old_xs, old_ys = sample.xs.clone(), sample.ys.clone()
+        # sample.xs.mul_(new_w).floor_divide_(w)
+        # sample.ys.mul_(new_h).floor_divide_(h)
+        # # To be exact for w and h, we calculate the post-coordinate
+        # # and round the coordinate to get width / height.
+        # sample.ws.add_(old_xs).mul_(new_w).floor_divide_(w).add_(1).sub_(sample.xs)
+        # sample.hs.add_(old_ys).mul_(new_h).floor_divide_(h).add_(1).sub_(sample.ys)
 
         # sample.xs[~has_bbox] = -1
         return sample
+
+    @staticmethod
+    def resize_bbox(w, h, new_w, new_h, bbox_x, bbox_y, bbox_w, bbox_h):
+        new_bbox_x = bbox_x.mul(new_w).floor_divide_(w)
+        new_bbox_y = bbox_y.mul(new_h).floor_divide_(h)
+
+        new_bbox_w = bbox_w.add(bbox_x).mul_(new_w).floor_divide_(w).add_(1).sub_(new_bbox_x)
+        new_bbox_h = bbox_h.add(bbox_y).mul_(new_h).floor_divide_(h).add_(1).sub_(new_bbox_y)
+
+        return new_bbox_x, new_bbox_y, new_bbox_w, new_bbox_h
 
 
 class RandomHorizontalFlip(tv.transforms.RandomHorizontalFlip):
@@ -154,10 +195,14 @@ class RandomHorizontalFlip(tv.transforms.RandomHorizontalFlip):
         if 'xs' not in sample or (sample.xs < 0.).all():
             return sample
 
-        # has_bbox = (sample.xs >= 0)
         h, w = sample.imgs.height, sample.imgs.width
-        sample.xs.add_(sample.bbox.ws).neg_().add_(w)
-        # sample.xs[~has_bbox] = -1
+        sample.xs.add_(sample.ws).neg_().add_(w)
+        return sample
+
+
+class ColorJitter(tv.transforms.ColorJitter):
+    def __call__(self, sample):
+        sample.imgs = super().__call__(sample.imgs)
         return sample
 
 

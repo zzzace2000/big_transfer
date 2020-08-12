@@ -66,10 +66,14 @@ def plot_results(x_test, x_test_im, sensMap, predDiff, tarFunc, classnames, test
 
 
 def pytorch_to_np(pytorch_image):
+    if pytorch_image.ndim == 4 and pytorch_image.shape[1] == 1:
+        pytorch_image = pytorch_image.repeat(1, 3, 1, 1)
     return pytorch_image.mul(255).clamp(0, 255).byte().permute(1, 2, 0).numpy()
 
 
-def plot_pytorch_img(pytorch_img, ax, cmap=None, **kwargs):
+def plot_pytorch_img(pytorch_img, ax=None, cmap=None, **kwargs):
+    if ax is None:
+        fig, ax = plt.subplots()
     return ax.imshow(pytorch_to_np(pytorch_img), cmap=cmap, interpolation='nearest', **kwargs)
 
 
@@ -79,6 +83,9 @@ def plot_rectangle(x, y, w, h, ax, color='red'):
     y = y.item() if isinstance(y, torch.Tensor) else y
     w = w.item() if isinstance(w, torch.Tensor) else w
     h = h.item() if isinstance(h, torch.Tensor) else h
+
+    if x == -1:
+        return
 
     ax.add_patch(
         patches.Rectangle(
@@ -98,7 +105,7 @@ def _preprocess_img_to_pytorch(img):
     return img
 
 
-def plot_orig_and_overlay_img(orig_img, overlayed_img, file_name, bbox_coord=None, gt_class_name='',
+def plot_orig_and_overlay_img(orig_img, overlayed_img, file_name=None, bbox_coord=None, gt_class_name='',
                               pred_class_name='', cmap=cm.seismic, clim=None, visualize=False):
     '''
     :param orig_img: PyTorch 3d array [channel, width, height]
@@ -151,13 +158,22 @@ def plot_orig_and_overlay_img(orig_img, overlayed_img, file_name, bbox_coord=Non
     plt.close()
 
 
-def get_overlayed_image(orig_img, color_vec, cmap=cm.seismic):
+def get_overlayed_images(orig_imgs, color_vecs, cmap=cm.seismic):
     '''
     :return: color_overlay_img: the image overlayed with noise color
     '''
-    orig_img = orig_img.cpu().numpy()
-    overlayed_img, clim = overlay(orig_img, color_vec, cmap=cmap)
-    return torch.from_numpy(overlayed_img), clim
+    assert orig_imgs.ndim == 4 and color_vecs.ndim == 4
+
+    result, clims = [], []
+    for orig_img, color_vec in zip(orig_imgs, color_vecs):
+        orig_img = orig_img.cpu().detach().numpy()
+        color_vec = color_vec.cpu().detach().numpy()
+        overlayed_img, clim = overlay(orig_img, color_vec[0], cmap=cmap)
+        result.append(torch.from_numpy(overlayed_img))
+        clims.append(clim)
+
+    result = torch.stack(result)
+    return result, clims
 
 
 def overlay(x, c, gray_factor_bg=0.3, alpha=0.8, cmap=cm.seismic):
@@ -217,23 +233,59 @@ def plot_pytorch_imgs(imgs_list, filename='', ncols=4, dpi=300, ax=None, clim=No
     return ax
 
 
-def plot_imgs_with_bboxes(imgs, bboxes=None, ncols=8):
+def plot_imgs_with_bboxes2(samples, ncols=8):
+    imgs = samples['imgs']
+    xs = samples['xs']
+    ys = samples['ys']
+    ws = samples['ws']
+    hs = samples['hs']
+
+    if imgs.ndim == 3: # only 1 img
+        return plot_img_with_bbox(
+            imgs, xs, ys, ws, hs)
+
     num_imgs = len(imgs)
     nrows = int(math.ceil(num_imgs / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 5, nrows * 5))
 
-    for idx, (img, bbox) in enumerate(zip(imgs, bboxes)):
-        if bboxes is not None:
-            plot_img_with_bbox(
-                img, bbox,
-                axes.flat[idx])
-        else:
+    if xs is None:
+        for idx, img in enumerate(imgs):
             plot_pytorch_img(img, axes.flat[idx])
+    else:
+        for idx, (img, x, y, w, h) in enumerate(zip(imgs, xs, ys, ws, hs)):
+            plot_img_with_bbox(
+                img, x, y, w, h,
+                fig=fig, ax=axes.flat[idx])
+    return fig, axes
+
+
+def plot_imgs_with_bboxes(imgs, xs=None, ys=None, ws=None, hs=None, ncols=8):
+    num_imgs = len(imgs)
+    nrows = int(math.ceil(num_imgs / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 5, nrows * 5))
+
+    if xs is None:
+        for idx, img in enumerate(imgs):
+            plot_pytorch_img(img, axes.flat[idx])
+    else:
+        for idx, (img, x, y, w, h) in enumerate(zip(imgs, xs, ys, ws, hs)):
+            plot_img_with_bbox(
+                img, x, y, w, h,
+                fig=fig,
+                ax=axes.flat[idx])
 
     return fig, axes
 
 
-def plot_img_with_bbox(img, bbox, ax):
+def plot_img_with_bbox(img, xs, ys, ws, hs, fig=None, ax=None):
+    if fig is None:
+        fig, ax = plt.subplots()
     im = plot_pytorch_img(img, ax)
-    for x, y, w, h in zip(bbox.xs, bbox.ys, bbox.ws, bbox.hs):
-        plot_rectangle(x, y, w, h, ax)
+
+    if torch.is_tensor(xs) and xs.ndim > 0:
+        for x, y, w, h in zip(xs, ys, ws, hs):
+            plot_rectangle(x, y, w, h, ax=ax)
+    else:
+        plot_rectangle(xs, ys, ws, hs, ax=ax)
+
+    return fig, ax
