@@ -23,10 +23,12 @@ class MyCCT_Dataset(torch.utils.data.Dataset):
     def __init__(self,
                  json_file='../datasets/cct/eccv_18_annotation_files/train_annotations.json',
                  cct_img_folder='../datasets/cct/eccv_18_all_images_sm/',
+                 remove_empty_img=True,
                  transform=None):
         super().__init__()
         self.json_file = json_file
         self.cct_img_folder = cct_img_folder
+        self.remove_empty_img = remove_empty_img
         self.transform = transform
 
         # Load json
@@ -47,11 +49,15 @@ class MyCCT_Dataset(torch.utils.data.Dataset):
                                     how='left', left_on='image_id', right_on='id')
         self.annotations = self.annotations[[
             'image_id', 'category_id', 'bbox', 'height', 'width']].reset_index(drop=True)
-        self.annotations = self.annotations[self.annotations.category_id != 30]
+        if self.remove_empty_img:
+            self.annotations = self.annotations[self.annotations.category_id != 30]
 
         # setup category_id to the target id
         cat_df = pd.DataFrame(tmp['categories'])
-        tmp2 = cat_df[cat_df.id != 30].sort_values('id').reset_index(drop=True)
+        if self.remove_empty_img:
+            cat_df = cat_df[cat_df.id != 30]
+
+        tmp2 = cat_df.sort_values('id').reset_index(drop=True)
         self.y_to_cat_id = tmp2['id']
         self.cat_id_to_y = pd.Series(self.y_to_cat_id.index,
                                      self.y_to_cat_id.values)
