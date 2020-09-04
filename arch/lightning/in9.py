@@ -11,26 +11,27 @@ import numpy as np
 
 from .xray import XRayLightningModel
 from ..data.cct_datasets import MyCCT_Dataset
+from ..data.imagenet_datasets import MyImageFolder, MyImagenetBoundingBoxFolder
+from ..data import bbox_utils
+import torchvision as tv
 from .. import models
 from ..data.imagenet_datasets import MySubset, MyConcatDataset
 from ..saliency_utils import get_grad_y, get_grad_sum, \
     get_grad_logp_sum, get_grad_logp_y, get_deeplift
 
 
-class CCTLightningModel(XRayLightningModel):
+class IN9LightningModel(XRayLightningModel):
     def init_setup(self):
         # Resnet 50
-        self.model = models.KNOWN_MODELS['BiT-S-R50x1'](
-            head_size=15,
-            zero_head=True)
-        self.my_logger.info("Fine-tuning from BiT")
-        self.model.load_from(np.load(f"models/BiT-S-R50x1.npz"))
+        arch = 'BiT-S-R50x1'
+        if 'arch' in self.hparams:
+            arch = self.hparams.arch
 
-        ## Resnet50 has reused the ReLU and not able to derive DeepLift
-        # self.model = resnet50(pretrained=True)
-        # self.model.fc = torch.nn.Linear(2048, 15, bias=True)
-        # torch.nn.init.zeros_(self.model.fc.weight)
-        # torch.nn.init.zeros_(self.model.fc.bias)
+        self.model = models.KNOWN_MODELS[arch](
+            head_size=9,
+            zero_head=False)
+        # self.my_logger.info("Fine-tuning from BiT")
+        # self.model.load_from(np.load(f"models/BiT-S-R50x1.npz"))
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         x, y = batch
@@ -38,8 +39,8 @@ class CCTLightningModel(XRayLightningModel):
             x = x['imgs']
 
         logit = self(x)
-        prefix = ['val', 'cis_test', 'trans_test'][dataloader_idx]
-
+        prefix = ['val', 'orig', 'mixed_same', 'mixed_rand',
+                  'mixed_next'][dataloader_idx]
         output = OrderedDict({
             f'{prefix}_logit': logit,
             f'{prefix}_y': y,
@@ -60,12 +61,6 @@ class CCTLightningModel(XRayLightningModel):
             _, pred = torch.max(logit, dim=1)
             y_onehot = torch.nn.functional.one_hot(y, num_classes=logit.shape[1])
 
-            # In cis_val and trans_test, some classes do not exist
-            non_zero_cls = (y_onehot.sum(dim=0) > 0)
-            if not non_zero_cls.all():
-                y_onehot = y_onehot[:, non_zero_cls]
-                logit = logit[:, non_zero_cls]
-
             prob = F.softmax(logit, dim=1)
             y, y_onehot, logit, pred = y.cpu().numpy(), y_onehot.cpu().numpy(), \
                                        logit.cpu().numpy(), pred.cpu().numpy()
@@ -78,12 +73,12 @@ class CCTLightningModel(XRayLightningModel):
             ece = np.mean(np.abs(fraction_of_positives - mean_predicted_value))
 
             tqdm_dict[f'{prefix}_ece'] = ece * 100
-            tqdm_dict[f'{prefix}_f1'] = f1_score(
-                y, pred, average='macro') * 100
-            tqdm_dict[f'{prefix}_auc'] = roc_auc_score(
-                y_onehot, logit, multi_class='ovr') * 100
-            tqdm_dict[f'{prefix}_aupr'] = average_precision_score(
-                y_onehot, logit) * 100
+            # tqdm_dict[f'{prefix}_f1'] = f1_score(
+            #     y, pred, average='macro') * 100
+            # tqdm_dict[f'{prefix}_auc'] = roc_auc_score(
+            #     y_onehot, logit, multi_class='ovr') * 100
+            # tqdm_dict[f'{prefix}_aupr'] = average_precision_score(
+            #     y_onehot, logit) * 100
 
             hist, bins = np.histogram(all_prob, bins=10)
             calibration_dict[f'{prefix}_frp'] = fraction_of_positives.tolist()
@@ -92,8 +87,10 @@ class CCTLightningModel(XRayLightningModel):
             calibration_dict[f'{prefix}_bins'] = bins.tolist()
 
         cal_metrics(outputs[0], 'val')
-        cal_metrics(outputs[1], 'cis_test')
-        cal_metrics(outputs[2], 'trans_test')
+        cal_metrics(outputs[1], 'orig')
+        cal_metrics(outputs[2], 'mixed_same')
+        cal_metrics(outputs[3], 'mixed_rand')
+        cal_metrics(outputs[4], 'mixed_next')
 
         result = {
             'progress_bar': tqdm_dict, 'log': tqdm_dict,
@@ -103,55 +100,63 @@ class CCTLightningModel(XRayLightningModel):
         return result
 
     def configure_optimizers(self):
-        optim = torch.optim.RMSprop(
+        optim = torch.optim.SGD(
             self.model.parameters(), lr=self.hparams.base_lr,
-            momentum=0.9)
+            momentum=0.9, weight_decay=1e-4)
         scheduler = {
             # Total 50 epochs
             'scheduler': torch.optim.lr_scheduler.MultiStepLR(
-                optim, milestones=[15, 30, 45], gamma=0.1),
+                optim, milestones=[6, 12, 18], gamma=0.1),
             'interval': 'epoch',
         }
         return [optim], [scheduler]
 
-    # @classmethod
-    # def counterfactual_ce_loss(cls, logit, y, reduction='none'):
-    #     '''
-    #     If it's counterfactual, assign it to empty class 11
-    #     '''
-    #     assert (y < 0).all(), str(y)
-    #     cf_y = 11 * torch.ones_like(y).long()
-    #     return F.cross_entropy(logit, cf_y, reduction=reduction)
-
     def _make_train_val_dataset(self):
-        train_d = MyCCT_Dataset(
-            '../datasets/cct/eccv_18_annotation_files/train_annotations.json',
-            transform=MyCCT_Dataset.get_train_bbox_transform()
-        )
-        val_d = MyCCT_Dataset(
-            '../datasets/cct/eccv_18_annotation_files/cis_val_annotations.json',
-            transform=MyCCT_Dataset.get_val_bbox_transform()
-        )
-        cis_test_d = MyCCT_Dataset(
-            '../datasets/cct/eccv_18_annotation_files/cis_test_annotations.json',
-            transform=MyCCT_Dataset.get_val_bbox_transform()
-        )
-        trans_test_d = MyCCT_Dataset(
-            '../datasets/cct/eccv_18_annotation_files/trans_test_annotations.json',
-            transform=MyCCT_Dataset.get_val_bbox_transform()
-        )
-        return train_d, [val_d, cis_test_d, trans_test_d]
+        train_d = MyImagenetBoundingBoxFolder(
+            '../datasets/bg_challenge/train/original/train/',
+            '../datasets/imagenet/LOC_train_solution.csv',
+            transform=MyImagenetBoundingBoxFolder.get_train_transform(
+                self.hparams.test_run))
+        val_d = MyImagenetBoundingBoxFolder(
+            '../datasets/bg_challenge/train/original/val/',
+            '../datasets/imagenet/LOC_train_solution.csv',
+            transform=MyImagenetBoundingBoxFolder.get_val_transform(
+                self.hparams.test_run))
+        orig_test_d = MyImagenetBoundingBoxFolder(
+            '../datasets/bg_challenge/test/original/val/',
+            '../datasets/imagenet/LOC_val_solution.csv',
+            transform=MyImagenetBoundingBoxFolder.get_val_transform(
+                self.hparams.test_run))
+        mixed_same_test_d = MyImagenetBoundingBoxFolder(
+            '../datasets/bg_challenge/test/mixed_same/val/',
+            '../datasets/imagenet/LOC_val_solution.csv',
+            transform=MyImagenetBoundingBoxFolder.get_val_transform(
+                self.hparams.test_run))
+        mixed_rand_test_d = MyImagenetBoundingBoxFolder(
+            '../datasets/bg_challenge/test/mixed_rand/val/',
+            '../datasets/imagenet/LOC_val_solution.csv',
+            transform=MyImagenetBoundingBoxFolder.get_val_transform(
+                self.hparams.test_run))
+        mixed_next_test_d = MyImagenetBoundingBoxFolder(
+            '../datasets/bg_challenge/test/mixed_next/val/',
+            '../datasets/imagenet/LOC_val_solution.csv',
+            transform=MyImagenetBoundingBoxFolder.get_val_transform(
+                self.hparams.test_run))
+
+        return train_d, [val_d, orig_test_d, mixed_same_test_d,
+                         mixed_rand_test_d, mixed_next_test_d]
 
     @classmethod
     def add_model_specific_args(cls, parser):
-        parser.add_argument("--max_epochs", type=int, default=50)
-        parser.add_argument("--batch", type=int, default=64,
+        parser.add_argument("--arch", type=str, default='BiT-S-R50x1')
+        parser.add_argument("--max_epochs", type=int, default=25)
+        parser.add_argument("--batch", type=int, default=32,
                             help="Batch size.")
         parser.add_argument("--val_batch", type=int, default=256,
                             help="Batch size.")
         parser.add_argument("--batch_split", type=int, default=1,
                             help="Number of batches to compute gradient on before updating weights.")
-        parser.add_argument("--base_lr", type=float, default=0.003)
+        parser.add_argument("--base_lr", type=float, default=0.05)
         parser.add_argument("--pl_model", type=str, default=cls.__name__)
         parser.add_argument("--reg_anneal", type=float, default=0.)
         return parser

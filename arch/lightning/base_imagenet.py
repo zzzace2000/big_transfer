@@ -14,45 +14,21 @@ import torch.utils.data
 import torch.utils.data.distributed
 import torch.utils.data.distributed
 import torchvision as tv
-from pytorch_lightning.core import LightningModule
 from sklearn.metrics import average_precision_score
 from pytorch_lightning.callbacks import ModelCheckpoint
 
-from .. import models, bit_common, bit_hyperrule
+from .. import models, bit_hyperrule
 from ..data import bbox_utils
 from ..data.imagenet_datasets import MyImagenetBoundingBoxFolder, MyImageFolder, MyConcatDataset, MySubset, \
     MyImageNetODataset, MyFactualAndCFDataset
-from ..inpainting.Baseline import RandomColorWithNoiseInpainter, ShuffleInpainter
 from ..inpainting.VAEInpainter import VAEInpainter
 from ..utils import output_csv, DotDict
 from ..saliency_utils import get_grad_y, get_grad_sum, \
-    get_grad_logp_sum, get_grad_logp_y, get_deeplift
+    get_grad_logp_sum, get_grad_logp_y, get_deeplift, get_grad_cam
+from .base import BaseLightningModel
 
 
-KNOWN_NUM_CLASSES = {
-    'objectnet': 113,
-    'imageneta': 200,
-}
-
-
-class ImageNetLightningModel(LightningModule):
-    def __init__(self, hparams):
-        """
-        Training imagenet models by fintuning from Big-Transfer models
-        """
-        super().__init__()
-        if isinstance(hparams, dict): # Fix the bug in pl in reloading
-            hparams = DotDict(hparams)
-        if 'result_dir' not in hparams:
-            hparams.result_dir = './results/'
-        self.hparams = hparams
-        self.my_logger = bit_common.setup_logger(self.hparams)
-        self.train_loader = None
-        self.valid_loaders = None
-
-        self.inpaint_model = self.get_inpainting_model()
-        self.init_setup()
-
+class ImageNetLightningModel(BaseLightningModel):
     def init_setup(self):
         # setup the learning rate schedule for how long we want to train
         self.lr_supports = [500, 3000, 6000, 9000, 10_000]
@@ -70,9 +46,6 @@ class ImageNetLightningModel(LightningModule):
         self.mixup = 0
         # if hparams.use_mixup:
         #     self.mixup = bit_hyperrule.get_mixup(len(train_set))
-
-    def forward(self, x):
-        return self.model(x)
 
     def on_fit_start(self):
         if self.global_step >= self.lr_supports[-1]:
@@ -157,7 +130,8 @@ class ImageNetLightningModel(LightningModule):
                 cf_logits = self(x_cf)
                 logits = torch.cat([logits, cf_logits], dim=0)
 
-        c = self.counterfact_cri(logits, y)
+        c, c_cf = self.counterfact_cri(logits, y)
+        c_cf *= self.hparams.cf_coeff
 
         # See clean img accuracy and cf img accuracy
         if not is_dict:
@@ -171,6 +145,14 @@ class ImageNetLightningModel(LightningModule):
             cf_acc1, cf_acc5 = self.accuracy(
                 logits[(len(y)//2):], cf_y, topk=(1, 5))
             cf_acc1, cf_acc5 = 100. - cf_acc1, 100. - cf_acc5
+
+        # Check NaN
+        for name, metric in [
+            ('train_loss', c),
+            ('reg_loss', reg_loss),
+        ]:
+            if torch.isnan(metric).all():
+                raise RuntimeError(f'metric {name} is Nan')
 
         tqdm_dict = {'train_loss': c, 'reg_loss': reg_loss, 'train_acc1': acc1, 'train_acc5': acc5,
                      **({} if not is_dict
@@ -187,26 +169,6 @@ class ImageNetLightningModel(LightningModule):
             'log': tqdm_dict,
         })
         return output
-
-    @staticmethod
-    def my_cosine_similarity(t1, t2, eps=1e-8):
-        if torch.all(t1 == 0.) or torch.all(t2 == 0.):
-            return t1.new_tensor(0.)
-        other_dim = list(range(1, t1.ndim))
-        iprod = (t1 * t2).sum(dim=other_dim)
-        t1_norm = (t1 * t1).sum(dim=other_dim).sqrt()
-        t2_norm = (t2 * t2).sum(dim=other_dim).sqrt()
-        cos_sim = iprod / (t1_norm * t2_norm + eps)
-        return cos_sim
-
-    @staticmethod
-    def diff_f1_score(pred, gnd_truth):
-        TP = pred.mul(gnd_truth).sum(dim=list(range(1, pred.ndim)))
-        FP = pred.mul(1. - gnd_truth).sum(dim=list(range(1, pred.ndim)))
-        FN = (1. - pred).mul(gnd_truth).sum(dim=list(range(1, pred.ndim)))
-
-        # (1 - F1) as the loss
-        return (2 * TP / (2 * TP + FP + FN)).mean()
 
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
         if dataloader_idx is None or dataloader_idx == 0:
@@ -282,8 +244,9 @@ class ImageNetLightningModel(LightningModule):
                 ys.cpu().numpy(), anomaly_scores.cpu().numpy())
 
         result = {
-            'progress_bar': tqdm_dict, 'log': tqdm_dict, 'val_loss': tqdm_dict["val_loss"],
-            'gstep': self.global_step, # forresult_dir checkpoint filename
+            'progress_bar': tqdm_dict, 'log': tqdm_dict,
+            'val_loss': tqdm_dict["val_loss"],
+            'gstep': self.global_step, # checkpoint filename
         }
 
         # Record it in the last training step
@@ -297,38 +260,6 @@ class ImageNetLightningModel(LightningModule):
             output_csv(pjoin(self.hparams.result_dir, 'results.csv'), csv_dict)
 
         return result
-
-    @classmethod
-    def accuracy(cls, output, target, topk=(1,)):
-        """Computes the accuracy over the k top predictions for the specified values of k"""
-        with torch.no_grad():
-            maxk = max(topk)
-            batch_size = target.size(0)
-
-            _, pred = output.topk(maxk, 1, True, True)
-            pred = pred.t()
-            correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-            res = []
-            for k in topk:
-                correct_k = correct[:k].view(-1).float().sum(0)
-                res.append(correct_k.mul_(100.0 / batch_size))
-            return res
-
-    @classmethod
-    def _generate_mask(cls, imgs, xs, ys, ws, hs):
-        mask = imgs.new_ones(imgs.shape[0], 1, *imgs.shape[2:])
-        for i, (xs, ys, ws, hs) in enumerate(zip(xs, ys, ws, hs)):
-            if xs.ndim == 0:
-                if xs > 0:
-                    mask[i, 0, ys:(ys + hs), xs:(xs + ws)] = 0.
-                continue
-
-            for coord_x, coord_y, w, h in zip(xs, ys, ws, hs):
-                if coord_x == -1:
-                    break
-                mask[i, 0, coord_y:(coord_y + h), coord_x:(coord_x + w)] = 0.
-        return mask
 
     def configure_optimizers(self):
         optimizer = torch.optim.SGD(
@@ -344,63 +275,6 @@ class ImageNetLightningModel(LightningModule):
             'interval': 'step',
         }
         return [optimizer], [scheduler]
-
-    @classmethod
-    def counterfact_cri(cls, logit, y):
-        if torch.all(y >= 0):
-            return F.cross_entropy(logit, y, reduction='mean')
-        if torch.all(y < 0):
-            return cls.counterfactual_ce_loss(logit, y) / y.shape[0]
-
-        loss1 = F.cross_entropy(logit[y >= 0], y[y >= 0], reduction='sum')
-        loss2 = cls.counterfactual_ce_loss(logit[y < 0], y[y < 0])
-
-        return (loss1 + loss2) / y.shape[0]
-
-    @classmethod
-    def counterfactual_ce_loss(cls, logit, y):
-        assert (y < 0).all(), str(y)
-        cf_logit, cf_y = logit, -(y + 1)
-
-        if cf_logit.shape[1] == 2: # 2-cls
-            return F.cross_entropy(logit, 1 - cf_y, reduction='mean')
-
-        # Implement my own logsumexp trick
-        m, _ = torch.max(cf_logit, dim=1, keepdim=True)
-        exp_logit = torch.exp(cf_logit - m)
-        sum_exp_logit = torch.sum(exp_logit, dim=1)
-
-        eps = 1e-20
-        num = (sum_exp_logit - exp_logit[torch.arange(exp_logit.shape[0]), cf_y])
-        num = torch.log(num + eps)
-        denon = torch.log(sum_exp_logit + eps)
-
-        # Negative log probability
-        loss2 = -(num - denon).sum()
-        return loss2
-
-    def train_dataloader(self):
-        if self.train_loader is None:
-            self._setup_loaders()
-        return self.train_loader
-
-    def val_dataloader(self):
-        if self.valid_loaders is None:
-            self._setup_loaders()
-        return self.valid_loaders
-
-    @staticmethod
-    def mixup_data(x, y, l):
-        """Returns mixed inputs, pairs of targets, and lambda"""
-        indices = torch.randperm(x.shape[0]).to(x.device)
-
-        mixed_x = l * x + (1 - l) * x[indices]
-        y_a, y_b = y, y[indices]
-        return mixed_x, y_a, y_b
-
-    @staticmethod
-    def mixup_criterion(criterion, pred, y_a, y_b, l):
-        return l * criterion(pred, y_a) + (1 - l) * criterion(pred, y_b)
 
     def _setup_loaders(self):
         train_set, valid_sets = self._make_train_val_dataset()
@@ -436,7 +310,8 @@ class ImageNetLightningModel(LightningModule):
             tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ])
 
-        valid_sets = [MyImageFolder(f"../datasets/{self.hparams.dataset}/", transform=val_tx)]
+        valid_sets = [MyImageFolder(f"../datasets/{self.hparams.dataset}/",
+                                    transform=val_tx)]
 
         df = pd.read_csv(pjoin(self.hparams.datadir, 'LOC_train_solution_size.csv'))
         def has_bbox(bbox_max_ratio=1., inverse=False):
@@ -528,57 +403,19 @@ class ImageNetLightningModel(LightningModule):
             (self.hparams.batch * (self.lr_supports[-1]))
         return train_set, valid_sets
 
-    @staticmethod
-    def sub_dataset(bbox_dataset, subset_data, sec_dataset=None):
-        if sec_dataset is not None:
-            assert len(sec_dataset) == len(bbox_dataset)
-
-        if subset_data == 0.:
-            if sec_dataset is None:
-                return None, bbox_dataset
-            return None, bbox_dataset, None, sec_dataset
-        if subset_data == 1. or subset_data >= len(bbox_dataset):
-            if sec_dataset is None:
-                return bbox_dataset, None
-            return bbox_dataset, None, sec_dataset, None
-
-        num = int(subset_data)
-        if subset_data < 1.:
-            num = int(len(bbox_dataset) * subset_data)
-
-        indices = torch.randperm(len(bbox_dataset))
-        first_dataset = MySubset(bbox_dataset, indices=indices[:num])
-        rest_dataset = MySubset(bbox_dataset, indices=indices[num:])
-        if sec_dataset is None:
-            return first_dataset, rest_dataset
-
-        fs = MySubset(sec_dataset, indices=indices[:num])
-        rs = MySubset(sec_dataset, indices=indices[num:])
-        return first_dataset, rest_dataset, fs, rs
-
     def get_inpainting_model(self):
-        if self.hparams.inpaint in ['none', 'cagan']:
-            inpaint_model = None
-        elif self.hparams.inpaint == 'mean':
-            inpaint_model = (lambda x, mask: x * mask)
-        elif self.hparams.inpaint == 'random':
-            inpaint_model = RandomColorWithNoiseInpainter((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        elif self.hparams.inpaint == 'shuffle':
-            inpaint_model = ShuffleInpainter()
-        elif self.hparams.inpaint == 'vae':
+        if self.hparams.inpaint == 'cagan':
+            return None
+
+        if self.hparams.inpaint == 'vae':
             inpaint_model = VAEInpainter(in_mean=(0.5, 0.5, 0.5), in_std=(0.5, 0.5, 0.5))
             gen_model_path = './inpainting_models/0928-VAE-Var-hole_lr_0.0002_epochs_7'
             inpaint_model.load_state_dict(
                 torch.load(gen_model_path, map_location=lambda storage, loc: storage)['state_dict'],
                 strict=False)
-        else:
-            raise NotImplementedError(f"Unkown inpaint {self.hparams.inpaint}")
+            return inpaint_model
 
-        return inpaint_model
-
-    def on_load_checkpoint(self, checkpoint):
-        ''' Fix the bug after loading the global step is not set '''
-        self.global_step = checkpoint['global_step']
+        return super().get_inpainting_model()
 
     @classmethod
     def add_model_specific_args(cls, parser):  # pragma: no-cover
@@ -601,25 +438,6 @@ class ImageNetLightningModel(LightningModule):
         parser.add_argument("--reg_anneal", type=float, default=0.)
         return parser
 
-    # @classmethod
-    # def init_model(cls, args):
-    #     fs = os.listdir(pjoin(args.logdir, args.name))
-    #     gsteps = [int(f.split('.')[0][6:])
-    #               for f in fs if f.startswith("gstep")]
-    #     if len(gsteps) == 0:
-    #         model = ImageNetLightningModel(args)
-    #     else:
-    #         # find the largest gstep
-    #         max_gstep = int(np.max(gsteps))
-    #         model = ImageNetLightningModel.load_from_checkpoint(
-    #             pjoin(args.logdir, args.name, 'gstep=%d.ckpt' % max_gstep)
-    #         )
-    #         model.my_logger.info('Loading models from gstep %d' % max_gstep)
-    #         if max_gstep == model.lr_supports[-1] - 1:
-    #             model.my_logger.info('Already finish this training!')
-    #             exit()
-    #     return model
-
     def pl_trainer_args(self):
         checkpoint_callback = ModelCheckpoint(
             filepath=pjoin(self.hparams.logdir, self.hparams.name, '{gstep}'),
@@ -635,7 +453,6 @@ class ImageNetLightningModel(LightningModule):
 
         args = dict()
         args['max_steps'] = (self.lr_supports[-1] - self.global_step - 1)
-        args['max_epochs'] = 1
         args['val_check_interval'] = val_check_interval
         args['checkpoint_callback'] = checkpoint_callback
 

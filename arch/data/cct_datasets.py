@@ -38,13 +38,20 @@ class MyCCT_Dataset(torch.utils.data.Dataset):
         annotations = pd.DataFrame(tmp['annotations'])
         images = pd.DataFrame(tmp['images'])[['id', 'height', 'width']]
 
+        # Merge bboxes for the same image
+        annotations = annotations.groupby(['image_id', 'category_id']).apply(
+            lambda x: np.nan if np.isnan(x.bbox.iloc[0]).any() else x.bbox.values.tolist())
+        annotations.name = 'bbox'
+        annotations = annotations.reset_index()
         self.annotations = pd.merge(annotations, images,
-                 how='left', left_on=['image_id'], right_on=['id'])
+                                    how='left', left_on='image_id', right_on='id')
         self.annotations = self.annotations[[
-            'image_id', 'category_id', 'bbox', 'height', 'width']]
+            'image_id', 'category_id', 'bbox', 'height', 'width']].reset_index(drop=True)
+        self.annotations = self.annotations[self.annotations.category_id != 30]
 
         # setup category_id to the target id
-        tmp2 = pd.DataFrame(tmp['categories']).sort_values('id').reset_index(drop=True)
+        cat_df = pd.DataFrame(tmp['categories'])
+        tmp2 = cat_df[cat_df.id != 30].sort_values('id').reset_index(drop=True)
         self.y_to_cat_id = tmp2['id']
         self.cat_id_to_y = pd.Series(self.y_to_cat_id.index,
                                      self.y_to_cat_id.values)
@@ -57,7 +64,7 @@ class MyCCT_Dataset(torch.utils.data.Dataset):
         if torch.is_tensor(idx):
             idx = idx.item()
 
-        record = self.annotations.loc[idx]
+        record = self.annotations.iloc[idx]
         img_path = pjoin(self.cct_img_folder, record['image_id'] + '.jpg')
         img = default_loader(img_path)
 
@@ -67,18 +74,29 @@ class MyCCT_Dataset(torch.utils.data.Dataset):
         result['imgs'] = img
         if np.isnan(record.bbox).any():
             result['xs'] = result['ys'] = result['ws'] = result['hs'] = \
-                torch.tensor(-1)
+                torch.tensor([-1])
         else:
             w, h = record.width, record.height
             new_w, new_h = img.width, img.height
-            bbox = [torch.tensor(int(v)) for v in record.bbox]
+
+            bbox_xs, bbox_ys, bbox_ws, bbox_hs = [], [], [], []
+            for (bbox_x, bbox_y, bbox_w, bbox_h) in record.bbox:
+                bbox_xs.append(int(bbox_x))
+                bbox_ys.append(int(bbox_y))
+                bbox_ws.append(int(bbox_w))
+                bbox_hs.append(int(bbox_h))
+            bbox_xs = torch.LongTensor(bbox_xs)
+            bbox_ys = torch.LongTensor(bbox_ys)
+            bbox_ws = torch.LongTensor(bbox_ws)
+            bbox_hs = torch.LongTensor(bbox_hs)
+
             # Do transformation!!!
             if w != new_w or h != new_h:
-                bbox = bbox_utils.Resize.resize_bbox(
-                    w, h, new_w, new_h, *bbox)
+                bbox_xs, bbox_ys, bbox_ws, bbox_hs = bbox_utils.Resize.resize_bbox(
+                    w, h, new_w, new_h, bbox_xs, bbox_ys, bbox_ws, bbox_hs)
 
             result['xs'], result['ys'], result['ws'], result['hs'] \
-                = bbox
+                = bbox_xs, bbox_ys, bbox_ws, bbox_hs
 
         if self.transform is not None:
             result = self.transform(result)
@@ -90,7 +108,7 @@ class MyCCT_Dataset(torch.utils.data.Dataset):
 
     @classmethod
     def get_train_bbox_transform(cls, test_run=False):
-        orig_size = 224 if not test_run else 56
+        orig_size = 224 if not test_run else 14
 
         train_tx = tv.transforms.Compose([
             bbox_utils.Resize(orig_size),
@@ -104,7 +122,7 @@ class MyCCT_Dataset(torch.utils.data.Dataset):
 
     @classmethod
     def get_val_bbox_transform(cls, test_run=False):
-        orig_size = 224 if not test_run else 56
+        orig_size = 224 if not test_run else 14
         val_tx = tv.transforms.Compose([
             bbox_utils.Resize((orig_size, orig_size)),
             bbox_utils.ToTensor(),

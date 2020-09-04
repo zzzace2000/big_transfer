@@ -16,7 +16,7 @@ thispath = os.path.dirname(os.path.realpath(__file__))
 class DatasetBase(torch.utils.data.Dataset):
     @classmethod
     def get_train_transform(cls, test_run=False):
-        orig_size = 224 if not test_run else 56
+        orig_size = 224 if not test_run else 14
 
         train_tx = tv.transforms.Compose([
             # By default the imageFolder loads images with 3 channels

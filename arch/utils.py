@@ -21,13 +21,18 @@ def output_csv(the_path, data_dict, order=None, delimiter=','):
             if col_title != old_col_title:
                 old_order = old_col_title.split(delimiter)
 
-                additional_keys = [k for k in keys if k not in old_order]
-                if len(additional_keys) > 0:
-                    print('WARNING! The data_dict has following additional keys %s' % (str(additional_keys)))
-
                 no_key = [k for k in old_order if k not in keys]
                 if len(no_key) > 0:
-                    raise(RuntimeError('The data_dict does not have the following old keys: %s' % str(no_key)))
+                    raise (RuntimeError('The data_dict does not have the '
+                                        'following old keys: %s' % str(no_key)))
+
+                additional_keys = [k for k in keys if k not in old_order]
+                if len(additional_keys) > 0:
+                    print('WARNING! The data_dict has following additional '
+                          'keys %s.' % (str(additional_keys)))
+                    col_title = delimiter.join([
+                        str(k) for k in old_order + additional_keys])
+                    print(col_title, file=op)
 
                 keys = old_order + additional_keys
 

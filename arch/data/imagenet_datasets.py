@@ -10,7 +10,8 @@ from torch.utils.data.sampler import Sampler
 import bisect
 from torch.nn.utils.rnn import pad_sequence
 from ..utils import DotDict
-from .bbox_utils import bbox_collate
+from . import bbox_utils
+import torchvision as tv
 
 
 class ImagenetBoundingBoxFolder(ImageFolder):
@@ -70,14 +71,22 @@ class ImagenetBoundingBoxFolder(ImageFolder):
 
         # Append the bounding box in the 4th channel
         filename = os.path.basename(path)
-
-        bbox = self.coord_dict[filename] if filename in self.coord_dict else None
-        sample = DotDict(imgs=imgs,
-            xs=bbox['xs'].clone(),
-            ys=bbox['ys'].clone(),
-            ws=bbox['ws'].clone(),
-            hs=bbox['hs'].clone(),
-        )
+        if filename not in self.coord_dict:
+            sample = DotDict(
+                imgs=imgs,
+                xs=torch.tensor([-1]),
+                ys=torch.tensor([-1]),
+                ws=torch.tensor([-1]),
+                hs=torch.tensor([-1]),
+            )
+        else:
+            bbox = self.coord_dict[filename]
+            sample = DotDict(imgs=imgs,
+                xs=bbox['xs'].clone(),
+                ys=bbox['ys'].clone(),
+                ws=bbox['ws'].clone(),
+                hs=bbox['hs'].clone(),
+            )
 
         if self.transform is not None:
             sample = self.transform(sample)
@@ -85,6 +94,33 @@ class ImagenetBoundingBoxFolder(ImageFolder):
             target = self.target_transform(target)
 
         return sample, target
+
+    @classmethod
+    def get_train_transform(self, test_run=False):
+        precut, cut = 256, 224
+        if test_run:
+            precut, cut = 16, 14
+
+        train_bbox_tx = tv.transforms.Compose([
+            bbox_utils.Resize((precut, precut)),
+            bbox_utils.RandomCrop((cut, cut)),
+            bbox_utils.RandomHorizontalFlip(),
+            bbox_utils.ColorJitter(),
+            bbox_utils.ToTensor(),
+            bbox_utils.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        return train_bbox_tx
+
+    @classmethod
+    def get_val_transform(self, test_run=False):
+        cut = 14 if test_run else 224
+
+        val_bbox_tx = tv.transforms.Compose([
+            bbox_utils.Resize((cut, cut)),
+            bbox_utils.ToTensor(),
+            bbox_utils.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        return val_bbox_tx
 
 
 class MyHackSampleSizeMixin(object):
@@ -130,7 +166,7 @@ class MyImagenetBoundingBoxFolder(MyHackSampleSizeMixin, ImagenetBoundingBoxFold
         return DataLoader(
             self, batch_size=batch_size // 2, shuffle=shuffle,
             num_workers=workers, pin_memory=True, drop_last=False,
-            collate_fn=bbox_collate)
+            collate_fn=bbox_utils.bbox_collate)
 
     @property
     def is_bbox_folder(self):
@@ -183,7 +219,7 @@ class MyConcatDataset(MyHackSampleSizeMixin, ConcatDataset):
         return DataLoader(
             self, batch_size=None, sampler=sampler,
             num_workers=workers, pin_memory=True, drop_last=False,
-            collate_fn=bbox_collate)
+            collate_fn=bbox_utils.bbox_collate)
 
     @property
     def use_my_batch_sampler(self):
@@ -272,7 +308,7 @@ class MyFactualAndCFDatasetBase(Dataset):
         return DataLoader(
             self, batch_size=batch_size // 2, shuffle=shuffle,
             num_workers=workers, pin_memory=True, drop_last=False,
-            collate_fn=bbox_collate)
+            collate_fn=bbox_utils.bbox_collate)
 
     @property
     def classes(self):

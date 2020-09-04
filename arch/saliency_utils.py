@@ -5,10 +5,9 @@ from captum.attr import (
     DeepLift,
     DeepLiftShap,
     IntegratedGradients,
-    LayerConductance,
-    NeuronConductance,
-    NoiseTunnel,
+    LayerGradCam,
 )
+from torch.nn import functional as F
 
 
 def _get_grad_base(x, y, model, callback, is_training=True, **kwargs):
@@ -61,12 +60,29 @@ def get_grad_logp_sum(x, y, model, is_training=True, **kwargs):
                           is_training=is_training, **kwargs)
 
 
-def get_deeplift(x, y, model, is_training=True, baselines=0.):
+def get_deeplift(x, y, model, is_training=True, baselines=None):
+    # if baselines is None:
+    #     # baselines = torch.zeros_like(x)
+    #     baselines = 0.
+
     with torch.enable_grad(), \
          HackGradAndOutputs(is_training=is_training) as hack:
-        dl = MyDeepLift(model, kept_backward=True)
+        dl = MyDeepLift(model, kept_backward=is_training)
         attributions = dl.attribute(x, baselines,
                                     target=y, return_convergence_delta=False)
         dl.kept_backward = False
         bs = x.shape[0]
         return attributions, hack.output[:bs]
+
+
+def get_grad_cam(x, y, model, is_training=True):
+    ''' Choose the last conv layer which only has 7x7 out of 224x224 '''
+    with torch.enable_grad(), \
+         HackGradAndOutputs(is_training=is_training) as hack:
+        lgc = LayerGradCam(model, model.get_grad_cam_layer())
+        attributions = lgc.attribute(x, target=y)
+
+        attributions = F.interpolate(
+            attributions, size=x.shape[-2:], mode='bilinear')
+
+        return attributions, hack.output

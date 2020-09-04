@@ -112,6 +112,7 @@ class ResNetV2(nn.Module):
   def __init__(self, block_units, width_factor, head_size=21843, zero_head=False):
     super().__init__()
     wf = width_factor  # shortcut 'cause we'll use it a lot.
+    self.head_size = head_size
 
     # The following will be unreadable if we split lines.
     # pylint: disable=line-too-long
@@ -151,22 +152,24 @@ class ResNetV2(nn.Module):
         ('conv', nn.Conv2d(2048*wf, head_size, kernel_size=1, bias=True)),
     ]))
 
+    if zero_head:
+        nn.init.zeros_(self.head.conv.weight)
+        nn.init.zeros_(self.head.conv.bias)
+
   def forward(self, x):
     x = self.head(self.body(self.root(x)))
     assert x.shape[-2:] == (1, 1)  # We should have no spatial shape left.
     return x[...,0,0]
 
-  def load_from(self, weights, prefix='resnet/'):
+  def load_from(self, weights, prefix='resnet/', last_layer_load=False):
     with torch.no_grad():
       self.root.conv.weight.copy_(tf2th(weights[f'{prefix}root_block/standardized_conv2d/kernel']))  # pylint: disable=line-too-long
       self.head.gn.weight.copy_(tf2th(weights[f'{prefix}group_norm/gamma']))
       self.head.gn.bias.copy_(tf2th(weights[f'{prefix}group_norm/beta']))
-      if self.zero_head:
-        nn.init.zeros_(self.head.conv.weight)
-        nn.init.zeros_(self.head.conv.bias)
-      else:
-        self.head.conv.weight.copy_(tf2th(weights[f'{prefix}head/conv2d/kernel']))  # pylint: disable=line-too-long
-        self.head.conv.bias.copy_(tf2th(weights[f'{prefix}head/conv2d/bias']))
+      if last_layer_load:
+          assert self.head_size == 1000
+          self.head.conv.weight.copy_(tf2th(weights[f'{prefix}head/conv2d/kernel']))  # pylint: disable=line-too-long
+          self.head.conv.bias.copy_(tf2th(weights[f'{prefix}head/conv2d/bias']))
 
       for bname, block in self.body.named_children():
         for uname, unit in block.named_children():
