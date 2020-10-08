@@ -36,17 +36,18 @@ class AdvInpainting(torch.nn.Module):
                                      self.eps)
             delta.data = torch.max(torch.min(
                 self.clip_max - X, delta.data), self.clip_min - X)
-            delta.data[mask == 1] = 0.
+            delta.data[(mask == 1).expand_as(delta)] = 0.
             delta = delta.detach()
         elif self.attack == 'pgd':
             delta = torch.zeros_like(X).uniform_(
                 -self.eps, self.eps)
             delta.data = torch.max(torch.min(
                 self.clip_max - X, delta.data), self.clip_min - X)
+            delta.requires_grad = True
 
             with ctx_noparamgrad(self.model):
                 for _ in range(self.nb_iter):
-                    delta.data[mask == 1] = 0.
+                    delta.data[(mask == 1).expand_as(delta)] = 0.
                     output = self.model(X + delta)
                     loss = self.loss_fn(output, y)
                     loss.backward()
@@ -58,7 +59,7 @@ class AdvInpainting(torch.nn.Module):
                         self.eps)[I]
                     delta.data[I] = torch.max(torch.min(
                         self.clip_max - X, delta.data), self.clip_min - X)[I]
-                delta.data[mask == 1] = 0.
+                delta.data[(mask == 1).expand_as(delta)] = 0.
                 delta = delta.detach()
 
         return X + delta

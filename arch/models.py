@@ -105,11 +105,13 @@ class PreActBottleneck(nn.Module):
         w = weights[f'{prefix}a/proj/{convname}/kernel']
         self.downsample.weight.copy_(tf2th(w))
 
-
+nn.Linear
+F.linear
 class ResNetV2(nn.Module):
   """Implementation of Pre-activation (v2) ResNet mode."""
 
-  def __init__(self, block_units, width_factor, head_size=21843, zero_head=False):
+  def __init__(self, block_units, width_factor, head_size=21843, zero_head=False,
+               in_channels=3):
     super().__init__()
     wf = width_factor  # shortcut 'cause we'll use it a lot.
     self.head_size = head_size
@@ -117,7 +119,7 @@ class ResNetV2(nn.Module):
     # The following will be unreadable if we split lines.
     # pylint: disable=line-too-long
     self.root = nn.Sequential(OrderedDict([
-        ('conv', StdConv2d(3, 64*wf, kernel_size=7, stride=2, padding=3, bias=False)),
+        ('conv', StdConv2d(in_channels, 64*wf, kernel_size=7, stride=2, padding=3, bias=False)),
         ('pad', nn.ConstantPad2d(1, 0)),
         ('pool', nn.MaxPool2d(kernel_size=3, stride=2, padding=0)),
         # The following is subtly not the same!

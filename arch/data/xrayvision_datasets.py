@@ -8,7 +8,6 @@ import torchvision as tv
 from torchvision.datasets.folder import default_loader
 
 from . import bbox_utils
-from ..utils import DotDict
 
 thispath = os.path.dirname(os.path.realpath(__file__))
 
@@ -129,7 +128,7 @@ class Kaggle_Dataset(DatasetBase):
                 img = self.transform(img)
             return img, target
 
-        new_result = DotDict()
+        new_result = dict()
         new_result['imgs'] = img
         new_result['xs'] = self.xs[idx]
         new_result['ys'] = self.ys[idx]

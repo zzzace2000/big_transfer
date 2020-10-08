@@ -53,8 +53,8 @@ class TileInpainter(InpaintTemplate):
     def generate_background(self, x, mask):
         # Find the largest rectangular with 1
         is_backgnd = (mask == 1)
-        is_row_with_backgnd = is_backgnd.all(dim=-2)[:, 0, :]
-        is_col_with_backgnd = is_backgnd.all(dim=-1)[:, 0, :]
+        is_col_with_backgnd = is_backgnd.all(dim=-2)[:, 0, :]
+        is_row_with_backgnd = is_backgnd.all(dim=-1)[:, 0, :]
 
         def find_largest_chunk(row):
             # does not seem to have an elegant vector way
@@ -68,9 +68,9 @@ class TileInpainter(InpaintTemplate):
                 false_idxes = tmp[~r]
 
                 max_len, max_s, max_e = 0, -1, -1
-                while len(true_idxes) > 0 and len(false_idxes) > 0:
+                while len(true_idxes) > 0:
                     s = true_idxes[0]
-                    e = false_idxes[0]
+                    e = len(r) if len(false_idxes) == 0 else false_idxes[0]
                     if (e - s) > max_len:
                         max_len, max_s, max_e = (e - s), s, e
 

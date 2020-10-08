@@ -1,6 +1,7 @@
 import os
 import torch
 import copy
+import time
 
 
 def output_csv(the_path, data_dict, order=None, delimiter=','):
@@ -44,6 +45,38 @@ def output_csv(the_path, data_dict, order=None, delimiter=','):
             vals.append(str(val))
 
         print(delimiter.join(vals), file=op)
+
+
+class Timer:
+    def __init__(self, name, remove_start_msg=True):
+        self.name = name
+        self.remove_start_msg = remove_start_msg
+
+    def __enter__(self):
+        self.start_time = time.time()
+        print('Run "%s".........' % self.name, end='\r' if self.remove_start_msg else '\n')
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        time_diff = float(time.time() - self.start_time)
+        time_str = '{:.1f}s'.format(time_diff) if time_diff >= 1 else '{:.0f}ms'.format(time_diff * 1000)
+
+        print('Finish "{}" in {}'.format(self.name, time_str))
+
+
+def generate_mask(imgs, xs, ys, ws, hs):
+    ''' It sets the bbox region as 1, and the outside as 0 '''
+    mask = imgs.new_zeros(imgs.shape[0], 1, *imgs.shape[2:])
+    for i, (xs, ys, ws, hs) in enumerate(zip(xs, ys, ws, hs)):
+        if xs.ndim == 0:
+            if xs > 0:
+                mask[i, 0, ys:(ys + hs), xs:(xs + ws)] = 1.
+            continue
+
+        for coord_x, coord_y, w, h in zip(xs, ys, ws, hs):
+            if coord_x == -1:
+                break
+            mask[i, 0, coord_y:(coord_y + h), coord_x:(coord_x + w)] = 1.
+    return mask
 
 
 class DotDict(dict):

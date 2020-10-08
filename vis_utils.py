@@ -68,7 +68,10 @@ def plot_results(x_test, x_test_im, sensMap, predDiff, tarFunc, classnames, test
 def pytorch_to_np(pytorch_image):
     if pytorch_image.ndim == 4 and pytorch_image.shape[1] == 1:
         pytorch_image = pytorch_image.repeat(1, 3, 1, 1)
-    return pytorch_image.mul(255).clamp(0, 255).byte().permute(1, 2, 0).numpy()
+    if pytorch_image.ndim == 3 and pytorch_image.shape[0] == 1:
+        pytorch_image = pytorch_image.repeat(3, 1, 1)
+
+    return pytorch_image.cpu().mul(255).clamp(0, 255).byte().permute(1, 2, 0).numpy()
 
 
 def plot_pytorch_img(pytorch_img, ax=None, cmap=None, **kwargs):
@@ -216,6 +219,7 @@ def overlay(x, c, gray_factor_bg=0.3, alpha=0.8, cmap=cm.seismic):
     img_masked = color.hsv2rgb(img_hsv)
     img_masked = np.transpose(img_masked, (2, 0, 1))
 
+    plt.close()
     return img_masked, clim
 
 

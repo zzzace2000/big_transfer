@@ -14,7 +14,6 @@ import json
 from os.path import join as pjoin, exists as pexists
 
 from . import bbox_utils
-from ..utils import DotDict
 
 thispath = os.path.dirname(os.path.realpath(__file__))
 
@@ -23,12 +22,18 @@ class MyCCT_Dataset(torch.utils.data.Dataset):
     def __init__(self,
                  json_file='../datasets/cct/eccv_18_annotation_files/train_annotations.json',
                  cct_img_folder='../datasets/cct/eccv_18_all_images_sm/',
+                 cf_inpaint_dir=None,
                  remove_empty_img=True,
+                 only_bbox_imgs=False,
+                 no_bbox=False,
                  transform=None):
         super().__init__()
         self.json_file = json_file
         self.cct_img_folder = cct_img_folder
+        self.cf_inpaint_dir = cf_inpaint_dir
         self.remove_empty_img = remove_empty_img
+        self.only_bbox_imgs = only_bbox_imgs
+        self.no_bbox = no_bbox
         self.transform = transform
 
         # Load json
@@ -51,6 +56,8 @@ class MyCCT_Dataset(torch.utils.data.Dataset):
             'image_id', 'category_id', 'bbox', 'height', 'width']].reset_index(drop=True)
         if self.remove_empty_img:
             self.annotations = self.annotations[self.annotations.category_id != 30]
+        if self.only_bbox_imgs:
+            self.annotations = self.annotations[~pd.isnull(self.annotations.bbox)]
 
         # setup category_id to the target id
         cat_df = pd.DataFrame(tmp['categories'])
@@ -75,8 +82,13 @@ class MyCCT_Dataset(torch.utils.data.Dataset):
         img = default_loader(img_path)
 
         target = self.cat_id_to_y[record.category_id]
+        if self.no_bbox:
+            assert self.cf_inpaint_dir is None, "Avoid myself being stupid."
+            if self.transform is not None:
+                img = self.transform(img)
+            return img, target
 
-        result = DotDict()
+        result = dict()
         result['imgs'] = img
         if np.isnan(record.bbox).any():
             result['xs'] = result['ys'] = result['ws'] = result['hs'] = \
@@ -103,6 +115,12 @@ class MyCCT_Dataset(torch.utils.data.Dataset):
 
             result['xs'], result['ys'], result['ws'], result['hs'] \
                 = bbox_xs, bbox_ys, bbox_ws, bbox_hs
+
+        if self.cf_inpaint_dir is not None:
+            cf_path = pjoin(self.cf_inpaint_dir, record['image_id'] + '.jpg')
+            result['imgs_cf'] = default_loader(cf_path) \
+                if pexists(cf_path) and (result['xs'] != -1).all() \
+                else None
 
         if self.transform is not None:
             result = self.transform(result)

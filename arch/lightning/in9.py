@@ -9,9 +9,9 @@ from sklearn.metrics import average_precision_score, roc_auc_score, f1_score
 from sklearn.calibration import calibration_curve
 import numpy as np
 
-from .xray import XRayLightningModel
-from ..data.cct_datasets import MyCCT_Dataset
+from .base import EpochBaseLightningModel
 from ..data.imagenet_datasets import MyImageFolder, MyImagenetBoundingBoxFolder
+from ..data.in9_datasets import IN9Dataset
 from ..data import bbox_utils
 import torchvision as tv
 from .. import models
@@ -20,14 +20,17 @@ from ..saliency_utils import get_grad_y, get_grad_sum, \
     get_grad_logp_sum, get_grad_logp_y, get_deeplift
 
 
-class IN9LightningModel(XRayLightningModel):
+class IN9LightningModel(EpochBaseLightningModel):
+    train_dataset = 'original'
+    milestones = [6, 12, 18]
+    max_epochs = 25
+
     def init_setup(self):
         # Resnet 50
-        arch = 'BiT-S-R50x1'
-        if 'arch' in self.hparams:
-            arch = self.hparams.arch
+        if 'arch' not in self.hparams:
+            self.hparams.arch = 'BiT-S-R50x1'
 
-        self.model = models.KNOWN_MODELS[arch](
+        self.model = models.KNOWN_MODELS[self.hparams.arch](
             head_size=9,
             zero_head=False)
         # self.my_logger.info("Fine-tuning from BiT")
@@ -73,12 +76,6 @@ class IN9LightningModel(XRayLightningModel):
             ece = np.mean(np.abs(fraction_of_positives - mean_predicted_value))
 
             tqdm_dict[f'{prefix}_ece'] = ece * 100
-            # tqdm_dict[f'{prefix}_f1'] = f1_score(
-            #     y, pred, average='macro') * 100
-            # tqdm_dict[f'{prefix}_auc'] = roc_auc_score(
-            #     y_onehot, logit, multi_class='ovr') * 100
-            # tqdm_dict[f'{prefix}_aupr'] = average_precision_score(
-            #     y_onehot, logit) * 100
 
             hist, bins = np.histogram(all_prob, bins=10)
             calibration_dict[f'{prefix}_frp'] = fraction_of_positives.tolist()
@@ -106,50 +103,66 @@ class IN9LightningModel(XRayLightningModel):
         scheduler = {
             # Total 50 epochs
             'scheduler': torch.optim.lr_scheduler.MultiStepLR(
-                optim, milestones=[6, 12, 18], gamma=0.1),
+                optim, milestones=self.milestones, gamma=0.1),
             'interval': 'epoch',
         }
         return [optim], [scheduler]
 
+    def get_inpainting_model(self, inpaint):
+        if inpaint == 'cagan':
+            return None
+        return super().get_inpainting_model(inpaint)
+
     def _make_train_val_dataset(self):
-        train_d = MyImagenetBoundingBoxFolder(
-            '../datasets/bg_challenge/train/original/train/',
-            '../datasets/imagenet/LOC_train_solution.csv',
-            transform=MyImagenetBoundingBoxFolder.get_train_transform(
-                self.hparams.test_run))
-        val_d = MyImagenetBoundingBoxFolder(
-            '../datasets/bg_challenge/train/original/val/',
-            '../datasets/imagenet/LOC_train_solution.csv',
-            transform=MyImagenetBoundingBoxFolder.get_val_transform(
-                self.hparams.test_run))
-        orig_test_d = MyImagenetBoundingBoxFolder(
+        cf_inpaint_dir = None
+        if self.hparams.inpaint == 'cagan':
+            # cf_inpaint_dir = '../datasets/bg_challenge/train/original_%s_cf_cagan/train/' \
+            #                  % self.hparams.mask
+            # Find the cagan for seg is pretty bad qualitatively and qunatitavely.
+            # Always use bbox version instead.
+            cf_inpaint_dir = '../datasets/bg_challenge/train/original_bbox_cf_cagan/train/'
+
+        if self.hparams.mask == 'bbox':
+            train_d = MyImagenetBoundingBoxFolder(
+                '../datasets/bg_challenge/train/%s/train/' % self.train_dataset,
+                '../datasets/imagenet/LOC_train_solution.csv',
+                cf_inpaint_dir=cf_inpaint_dir,
+                transform=MyImagenetBoundingBoxFolder.get_train_transform(
+                    self.hparams.test_run))
+        else:
+            train_d = IN9Dataset(
+                '../datasets/bg_challenge/train/%s/train/' % self.train_dataset,
+                no_fg_dir='../datasets/bg_challenge/train/no_fg/train/',
+                cf_inpaint_dir=cf_inpaint_dir,
+                transform=IN9Dataset.get_train_transform(self.hparams.test_run)
+            )
+
+        val_d = MyImageFolder(
+            '../datasets/bg_challenge/train/%s/val/' % self.train_dataset,
+            transform=MyImageFolder.get_val_transform(self.hparams.test_run))
+        orig_test_d = MyImageFolder(
             '../datasets/bg_challenge/test/original/val/',
-            '../datasets/imagenet/LOC_val_solution.csv',
-            transform=MyImagenetBoundingBoxFolder.get_val_transform(
-                self.hparams.test_run))
-        mixed_same_test_d = MyImagenetBoundingBoxFolder(
+            transform=MyImageFolder.get_val_transform(self.hparams.test_run))
+        mixed_same_test_d = MyImageFolder(
             '../datasets/bg_challenge/test/mixed_same/val/',
-            '../datasets/imagenet/LOC_val_solution.csv',
-            transform=MyImagenetBoundingBoxFolder.get_val_transform(
-                self.hparams.test_run))
-        mixed_rand_test_d = MyImagenetBoundingBoxFolder(
+            transform=MyImageFolder.get_val_transform(self.hparams.test_run))
+        mixed_rand_test_d = MyImageFolder(
             '../datasets/bg_challenge/test/mixed_rand/val/',
-            '../datasets/imagenet/LOC_val_solution.csv',
-            transform=MyImagenetBoundingBoxFolder.get_val_transform(
-                self.hparams.test_run))
-        mixed_next_test_d = MyImagenetBoundingBoxFolder(
+            transform=MyImageFolder.get_val_transform(self.hparams.test_run))
+        mixed_next_test_d = MyImageFolder(
             '../datasets/bg_challenge/test/mixed_next/val/',
-            '../datasets/imagenet/LOC_val_solution.csv',
-            transform=MyImagenetBoundingBoxFolder.get_val_transform(
-                self.hparams.test_run))
+            transform=MyImageFolder.get_val_transform(self.hparams.test_run))
 
         return train_d, [val_d, orig_test_d, mixed_same_test_d,
                          mixed_rand_test_d, mixed_next_test_d]
 
     @classmethod
     def add_model_specific_args(cls, parser):
+        # To use bbox as mask or segmentation mask
+        parser.add_argument("--mask", type=str, default='bbox',
+                            choices=['bbox', 'seg'])
         parser.add_argument("--arch", type=str, default='BiT-S-R50x1')
-        parser.add_argument("--max_epochs", type=int, default=25)
+        parser.add_argument("--max_epochs", type=int, default=cls.max_epochs)
         parser.add_argument("--batch", type=int, default=32,
                             help="Batch size.")
         parser.add_argument("--val_batch", type=int, default=256,
@@ -174,7 +187,6 @@ class IN9LightningModel(XRayLightningModel):
         args = dict()
         args['max_epochs'] = self.hparams.max_epochs
         args['checkpoint_callback'] = checkpoint_callback
-
         last_ckpt = pjoin(self.hparams.logdir, self.hparams.name, 'last.ckpt')
         if pexists(last_ckpt):
             args['resume_from_checkpoint'] = last_ckpt
@@ -182,3 +194,9 @@ class IN9LightningModel(XRayLightningModel):
 
     def get_grad_cam_layer(self):
         return self.model.head[1]
+
+
+class IN9LLightningModel(IN9LightningModel):
+    train_dataset = 'in9l'
+    milestones = [5, 10, 15]
+    max_epochs = 20

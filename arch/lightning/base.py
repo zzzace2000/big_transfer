@@ -25,7 +25,7 @@ from ..data.imagenet_datasets import MyImagenetBoundingBoxFolder, MyImageFolder,
 from ..inpainting.Baseline import RandomColorWithNoiseInpainter, ShuffleInpainter, TileInpainter
 from ..inpainting.AdvInpainting import AdvInpainting
 from ..inpainting.VAEInpainter import VAEInpainter
-from ..utils import output_csv, DotDict
+from ..utils import output_csv, DotDict, generate_mask
 from ..saliency_utils import get_grad_y, get_grad_sum, \
     get_grad_logp_sum, get_grad_logp_y, get_deeplift, get_grad_cam
 
@@ -42,10 +42,10 @@ class BaseLightningModel(LightningModule):
         self.my_logger = bit_common.setup_logger(self.hparams)
         self.train_loader = None
         self.valid_loaders = None
+        self.init_setup()
 
         self.inpaint = self.get_inpainting_model(self.hparams.inpaint)
-        self.f_inpaint = self.get_f_inpainting_model(self.hparams.f_inpaint)
-        self.init_setup()
+        self.f_inpaint = self.get_inpainting_model(self.hparams.f_inpaint)
 
         # Backward compatability
         if 'cf' not in self.hparams:
@@ -55,6 +55,133 @@ class BaseLightningModel(LightningModule):
 
     def forward(self, x):
         return self.model(x)
+
+    def training_step(self, batch, batch_idx, is_training=True):
+        s, l = batch
+
+        is_dict = isinstance(s, dict)
+        if not is_dict:
+            x, y = s, l
+        else:
+            orig_x_len = len(s['imgs'])
+            if 'masks' in s:
+                if s['masks'] is None:
+                    has_bbox = s['imgs'].new_zeros(s['imgs'].shape[0]).bool()
+                else:
+                    mask = s['masks']
+                    has_bbox = (mask == 1).any(dim=3).any(dim=2).any(dim=1)
+            else:
+                has_bbox = (s['xs'] != -1)
+                if has_bbox.ndim == 2: # multiple bboxes
+                    has_bbox = has_bbox.any(dim=1)
+
+                mask = generate_mask(
+                    s['imgs'], s['xs'], s['ys'], s['ws'], s['hs'])
+            if self.hparams.inpaint == 'none' or has_bbox.sum() == 0:
+                x, y = s['imgs'], l
+            else:
+                if 'imgs_cf' in s:
+                    impute_x = s['imgs_cf'][has_bbox]
+                else:
+                    impute_x = self.inpaint(s['imgs'][has_bbox], 1 - mask[has_bbox])
+                impute_y = (-l[has_bbox] - 1)
+
+                x = torch.cat([s['imgs'], impute_x], dim=0)
+                # label -1 as negative of class 0, -2 as negative of class 1 etc...
+                y = torch.cat([l, impute_y], dim=0)
+
+            if self.hparams.f_inpaint != 'none' and has_bbox.any():
+                impute_x = self.f_inpaint(
+                    s['imgs'][has_bbox], mask[has_bbox], l[has_bbox])
+                x = torch.cat([x, impute_x], dim=0)
+                y = torch.cat([y, l[has_bbox]], dim=0)
+
+        if not is_dict or self.hparams.get('reg', 'none') == 'none' \
+                or (is_dict and (~has_bbox).all()):
+            logits = self(x)
+            reg_loss = logits.new_tensor(0.)
+        else:
+            x_orig, y_orig = x[:orig_x_len], y[:orig_x_len]
+            saliency_fn = eval(f"get_{self.hparams.get('reg_grad', 'grad_y')}")
+            the_grad, logits = saliency_fn(x_orig, y_orig, self,
+                                           is_training=is_training)
+            if torch.all(the_grad == 0.):
+                reg_loss = logits.new_tensor(0.)
+            elif self.hparams.reg == 'gs':
+                assert is_dict and self.hparams.inpaint != 'none'
+                if not has_bbox.any():
+                    reg_loss = logits.new_tensor(0.)
+                else:
+                    x_orig, x_cf = x[:orig_x_len], x[orig_x_len:(orig_x_len + has_bbox.sum())]
+                    dist = x_orig[has_bbox] - x_cf
+                    cos_sim = self.my_cosine_similarity(the_grad, dist)
+
+                    reg_loss = (1. - cos_sim).mean().mul_(self.hparams.reg_coeff)
+            elif self.hparams.reg == 'bbox_o':
+                reg_loss = ((the_grad[has_bbox] * (1 - mask[has_bbox])) ** 2).mean()\
+                    .mul_(self.hparams.reg_coeff)
+            elif self.hparams.reg == 'bbox_f1':
+                norm = (the_grad[has_bbox] ** 2).sum(dim=1, keepdim=True)
+                norm = (norm - norm.min()) / norm.max()
+                gnd_truth = mask[has_bbox]
+
+                f1 = self.diff_f1_score(norm, gnd_truth)
+                # (1 - F1) as the loss
+                reg_loss = (1. - f1).mul_(self.hparams.reg_coeff)
+            else:
+                raise NotImplementedError(self.hparams.reg)
+
+            # Doing annealing for reg loss
+            if self.hparams.reg_anneal > 0.:
+                anneal = self.global_step / (self.hparams.max_epochs * len(self.train_loader)
+                                             * self.hparams.reg_anneal)
+                reg_loss *= anneal
+
+            if len(x) > orig_x_len: # Other f or cf images
+                cf_logits = self(x[orig_x_len:])
+                logits = torch.cat([logits, cf_logits], dim=0)
+
+        c, c_cf = self.counterfact_cri(logits, y)
+        c_cf *= self.hparams.cf_coeff
+
+        # See clean img accuracy and cf img accuracy
+        if not is_dict or (~has_bbox).all() or self.hparams.inpaint == 'none':
+            acc1, = self.accuracy(logits, y, topk=(1,))
+            cf_acc1 = acc1.new_tensor(-1.)
+        else:
+            acc1, = self.accuracy(
+                logits[:orig_x_len], y[:orig_x_len], topk=(1,))
+
+            cf_y = -(y[orig_x_len:] + 1)
+            cf_acc1, = self.accuracy(
+                logits[orig_x_len:], cf_y, topk=(1,))
+            cf_acc1 = 100. - cf_acc1
+
+        # Check NaN
+        for name, metric in [
+            ('train_loss', c),
+            ('cf_loss', c_cf),
+            ('reg_loss', reg_loss),
+        ]:
+            if torch.isnan(metric).all():
+                raise RuntimeError(f'metric {name} is Nan')
+
+        tqdm_dict = {'train_loss': c,
+                     'cf_loss': c_cf,
+                     'reg_loss': reg_loss,
+                     'train_acc1': acc1,
+                     'train_cf_acc1': cf_acc1}
+        output = OrderedDict({
+            'loss': c + c_cf + reg_loss,
+            'train_loss': c,
+            'cf_loss': c_cf,
+            'reg_loss': reg_loss,
+            'acc1': acc1,
+            'cf_acc1': cf_acc1,
+            'progress_bar': tqdm_dict,
+            'log': tqdm_dict,
+        })
+        return output
 
     @staticmethod
     def my_cosine_similarity(t1, t2, eps=1e-8):
@@ -92,21 +219,6 @@ class BaseLightningModel(LightningModule):
                 correct_k = correct[:k].view(-1).float().sum(0)
                 res.append(correct_k.mul_(100.0 / batch_size))
             return res
-
-    @classmethod
-    def _generate_mask(cls, imgs, xs, ys, ws, hs):
-        mask = imgs.new_ones(imgs.shape[0], 1, *imgs.shape[2:])
-        for i, (xs, ys, ws, hs) in enumerate(zip(xs, ys, ws, hs)):
-            if xs.ndim == 0:
-                if xs > 0:
-                    mask[i, 0, ys:(ys + hs), xs:(xs + ws)] = 0.
-                continue
-
-            for coord_x, coord_y, w, h in zip(xs, ys, ws, hs):
-                if coord_x == -1:
-                    break
-                mask[i, 0, coord_y:(coord_y + h), coord_x:(coord_x + w)] = 0.
-        return mask
 
     def configure_optimizers(self):
         raise NotImplementedError()
@@ -246,9 +358,12 @@ class BaseLightningModel(LightningModule):
         elif inpaint == 'tile':
             inpaint_model = TileInpainter()
         elif inpaint in ['pgd', 'fgsm']:
+            alpha = self.hparams.alpha
+            if alpha == -1:
+                alpha = self.hparams.eps * 1.25
             inpaint_model = AdvInpainting(
                 self.model, eps=self.hparams.eps,
-                alpha=self.hparams.alpha,
+                alpha=alpha,
                 attack=inpaint)
         else:
             raise NotImplementedError(f"Unkown inpaint {inpaint}")
@@ -261,3 +376,19 @@ class BaseLightningModel(LightningModule):
 
     def pl_trainer_args(self):
         raise NotImplementedError()
+
+    def is_finished_run(self):
+        raise NotImplementedError()
+
+
+class EpochBaseLightningModel(BaseLightningModel):
+    def is_finished_run(self):
+        last_ckpt = pjoin(self.hparams.logdir, self.hparams.name, 'last.ckpt')
+        if pexists(last_ckpt):
+            last_epoch = torch.load(last_ckpt)['epoch']
+            if last_epoch >= self.hparams.max_epochs:
+                print('Already finish fitting! Max %d Last %d'
+                      % (self.hparams.max_epochs, last_epoch))
+                return True
+
+        return False

@@ -1,5 +1,6 @@
 from torchvision.datasets import ImageFolder
 import os
+from os.path import join as pjoin, exists as pexists
 import numpy as np
 import torch
 import random
@@ -9,7 +10,6 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.sampler import Sampler
 import bisect
 from torch.nn.utils.rnn import pad_sequence
-from ..utils import DotDict
 from . import bbox_utils
 import torchvision as tv
 
@@ -18,8 +18,10 @@ class ImagenetBoundingBoxFolder(ImageFolder):
     ''' Custom loader that loads images with bounding box '''
 
     def __init__(self, root, bbox_file, is_valid_file=None,
+                 cf_inpaint_dir=None,
                  only_bbox_imgs=False, **kwargs):
         ''' bbox_file points to either `LOC_train_solution.csv` or `LOC_val_solution.csv` '''
+        self.cf_inpaint_dir = cf_inpaint_dir
         self.coord_dict = self.parse_coord_dict(bbox_file)
         if is_valid_file is None and only_bbox_imgs is True:
             is_valid_file = lambda path: os.path.basename(path) in self.coord_dict
@@ -53,7 +55,7 @@ class ImagenetBoundingBoxFolder(ImageFolder):
                     hs.append((int(y2) - int(y1)))
 
                 # Only take the first bounding box which is the ground truth
-                coord_dict[filename] = DotDict(
+                coord_dict[filename] = dict(
                     xs=torch.LongTensor(xs),
                     ys=torch.LongTensor(ys),
                     ws=torch.LongTensor(ws),
@@ -72,7 +74,7 @@ class ImagenetBoundingBoxFolder(ImageFolder):
         # Append the bounding box in the 4th channel
         filename = os.path.basename(path)
         if filename not in self.coord_dict:
-            sample = DotDict(
+            sample = dict(
                 imgs=imgs,
                 xs=torch.tensor([-1]),
                 ys=torch.tensor([-1]),
@@ -81,12 +83,18 @@ class ImagenetBoundingBoxFolder(ImageFolder):
             )
         else:
             bbox = self.coord_dict[filename]
-            sample = DotDict(imgs=imgs,
+            sample = dict(imgs=imgs,
                 xs=bbox['xs'].clone(),
                 ys=bbox['ys'].clone(),
                 ws=bbox['ws'].clone(),
                 hs=bbox['hs'].clone(),
             )
+
+        if self.cf_inpaint_dir is not None:
+            cls_name = self.classes[target]
+            img_name = path.split("/")[-1]
+            cf_path = pjoin(self.cf_inpaint_dir, cls_name, img_name)
+            sample['imgs_cf'] = self.loader(cf_path) if pexists(cf_path) else None
 
         if self.transform is not None:
             sample = self.transform(sample)
@@ -158,13 +166,41 @@ class MyImageFolder(MyHackSampleSizeMixin, ImageFolder):
     def is_bbox_folder(self):
         return False
 
+    @classmethod
+    def get_train_transform(self, test_run=False):
+        precut, cut = 256, 224
+        if test_run:
+            precut, cut = 16, 14
+
+        train_bbox_tx = tv.transforms.Compose([
+            tv.transforms.Resize((precut, precut)),
+            tv.transforms.RandomCrop((cut, cut)),
+            tv.transforms.RandomHorizontalFlip(),
+            tv.transforms.ColorJitter(),
+            tv.transforms.ToTensor(),
+            tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        return train_bbox_tx
+
+    @classmethod
+    def get_val_transform(self, test_run=False):
+        cut = 14 if test_run else 224
+
+        val_bbox_tx = tv.transforms.Compose([
+            tv.transforms.Resize((cut, cut)),
+            tv.transforms.ToTensor(),
+            tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        return val_bbox_tx
+
 
 class MyImagenetBoundingBoxFolder(MyHackSampleSizeMixin, ImagenetBoundingBoxFolder):
     def make_loader(self, batch_size, shuffle, workers):
-        if self.my_num_samples is not None:
-            self.my_num_samples //= 2
+        # if self.my_num_samples is not None:
+        #     self.my_num_samples //= 2
+        # batch_size = batch_size // 2
         return DataLoader(
-            self, batch_size=batch_size // 2, shuffle=shuffle,
+            self, batch_size=batch_size, shuffle=shuffle,
             num_workers=workers, pin_memory=True, drop_last=False,
             collate_fn=bbox_utils.bbox_collate)
 
@@ -206,9 +242,12 @@ class MyConcatDataset(MyHackSampleSizeMixin, ConcatDataset):
         '''
         Possibly 1 bbox folder and 1 img folder, or 2 img folders
         '''
+        my_self = self
+        while isinstance(my_self, MySubset):
+            my_self = my_self.dataset
         # all bbox folder or not-bbox folder
         if np.all(self.is_bbox_folder) or not np.any(self.is_bbox_folder):
-            return self.datasets[0].__class__.make_loader(
+            return my_self.datasets[0].__class__.make_loader(
                 self, batch_size, shuffle, workers)
 
         # 1 img folder and 1 bbox folder
@@ -303,10 +342,11 @@ class MyFactualAndCFDatasetBase(Dataset):
         return len(self.factual_folder)
 
     def make_loader(self, batch_size, shuffle, workers):
-        if self.my_num_samples is not None:
-            self.my_num_samples //= 2
+        # if self.my_num_samples is not None:
+        #     self.my_num_samples //= 2
+        # batch_size = batch_size // 2
         return DataLoader(
-            self, batch_size=batch_size // 2, shuffle=shuffle,
+            self, batch_size=batch_size, shuffle=shuffle,
             num_workers=workers, pin_memory=True, drop_last=False,
             collate_fn=bbox_utils.bbox_collate)
 

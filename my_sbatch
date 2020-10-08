@@ -15,15 +15,21 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--name', type=str, required=True)
 parser.add_argument('--gpus', type=int, default=1)
 parser.add_argument('--mem', type=int, default=16)
-parser.add_argument('--partition', type=str, default=None)
-parser.add_argument('--cpu_per_gpu', type=int, default=2)
+parser.add_argument('-p', '--partition', type=str, default=None)
+parser.add_argument('--cpu', type=int, default=8)
 parser.add_argument("--test_run", type=int, default=0)
+parser.add_argument('--qos', type=str, default='normal')
 
 args, unknownargs = parser.parse_known_args()
 
 if args.partition is None:
-    # If in q, use gpu patition. In vaugan, use p100
-    args.partition = 'p100' if platform.node() == 'vremote' else 'gpu'
+    # If in vaugan, use t4v2 (the preemption one), else (q) use gpu
+    if platform.node() == 'q.vector.local':
+        args.partition = 'gpu'
+    elif platform.node() in ['v', 'vremote']:
+        args.partition = 't4v2'
+    else:
+        raise NotImplementedError()
 
 temp_file = './tmp_sbatch_file.sh'
 
@@ -34,18 +40,15 @@ with open(temp_file, 'w') as fh:
 ## SLURM SUBMIT SCRIPT
 #SBATCH --nodes=1
 
-## choose among nlp or gpu in MARS
 #SBATCH -p {args.partition}
 #SBATCH --gres=gpu:{args.gpus}
 #SBATCH --mem={args.mem}G
 #SBATCH --time=7-00:00:00
 #SBATCH --job-name={args.name}
 #SBATCH --output=logs/{args.name}.log
-#SBATCH --cpus-per-task={args.gpus * args.cpu_per_gpu}
-#SBATCH --qos=normal
-
-## 90 seconds before training ends
-#SBATCH --signal=SIGUSR1@90
+#SBATCH --cpus-per-task={args.cpu}
+#SBATCH --qos={args.qos}
+{'#SBATCH --account=deadline' if args.qos == 'deadline' else ''}
 
 source /h/kingsley/.bashrc
 

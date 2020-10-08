@@ -21,23 +21,38 @@ def bbox_collate(batch):
     '''
     if torch.is_tensor(batch[0][0]):
         return default_collate(batch)
-    if isinstance(batch[0][0], dict) and 'xs' not in batch[0][0]:
+    if isinstance(batch[0][0], dict) and 'xs' not in batch[0][0] \
+            and 'masks' not in batch[0][0]:
         return default_collate(batch)
-    if batch[0][0].xs.ndim == 0:
+    if 'masks' not in batch[0][0] and batch[0][0]['xs'].ndim == 0:
         return default_collate(batch)
 
     samples = [item[0] for item in batch]
-    # pad the bboxes into xs, ys, ws, hs
-    data = {
-        'xs': pad_sequence([sample.xs for sample in samples], batch_first=True, padding_value=-1.),
-        'ys': pad_sequence([sample.ys for sample in samples], batch_first=True, padding_value=-1.),
-        'ws': pad_sequence([sample.ws for sample in samples], batch_first=True, padding_value=-1.),
-        'hs': pad_sequence([sample.hs for sample in samples], batch_first=True, padding_value=-1.),
-    }
+    if 'masks' not in batch[0][0]: # do the bbox
+        # pad the bboxes into xs, ys, ws, hs
+        data = {
+            'xs': pad_sequence([sample['xs'] for sample in samples], batch_first=True, padding_value=-1.),
+            'ys': pad_sequence([sample['ys'] for sample in samples], batch_first=True, padding_value=-1.),
+            'ws': pad_sequence([sample['ws'] for sample in samples], batch_first=True, padding_value=-1.),
+            'hs': pad_sequence([sample['hs'] for sample in samples], batch_first=True, padding_value=-1.),
+        }
+    else: # only do the masks instead
+        data = {}
+        masks = [s['masks'] for s in samples]
+        if masks == [None] * len(masks):
+            data['masks'] = None
+        else:
+            masks = [torch.zeros(1, *samples[0]['imgs'].shape[1:]) if m is None
+                     else m for m in masks]
+            data['masks'] = torch.stack(masks, dim=0)
 
     data['imgs'] = default_collate([item['imgs'] for item in samples])
     if 'imgs_cf' in samples[0]:
-        data['imgs_cf'] = default_collate([item['imgs_cf'] for item in samples])
+        imgs_cf = [s['imgs_cf'] for s in samples]
+        if imgs_cf != [None] * len(imgs_cf):
+            imgs_cf = [torch.zeros_like(samples[0]['imgs']) if m is None
+                       else m for m in imgs_cf]
+            data['imgs_cf'] = torch.stack(imgs_cf, dim=0)
 
     targets = default_collate([item[1] for item in batch])
     return [data, targets]
@@ -48,33 +63,33 @@ def bbox_collate(batch):
 ##################################################################
 class RandomCrop(tv.transforms.RandomCrop):
     def __call__(self, sample):
-        img = sample.imgs
 
-        if 'xs' not in sample or (sample.xs < 0.).all():
+        img = sample['imgs']
+
+        if ('masks' in sample and sample['masks'] is None) \
+                or ('masks' not in sample and ('xs' not in sample or (sample['xs'] < 0.).all())):
             i, j, h, w = self.get_params(img, self.size)
-            sample.imgs = F.crop(img, i, j, h, w)
+            sample['imgs'] = F.crop(img, i, j, h, w)
+            if 'imgs_cf' in sample and sample['imgs_cf'] is not None:
+                sample['imgs_cf'] = F.crop(sample['imgs_cf'], i, j, h, w)
             return sample
 
-        low_i = (sample.ys - self.size[0] + 1).clamp_(0).min().item()
-        low_j = (sample.xs - self.size[1] + 1).clamp_(0).min().item()
-        max_i = (sample.ys + sample.hs - 1).max().item()
-        max_j = (sample.xs + sample.ws - 1).max().item()
+        low_i = (sample['ys'] - self.size[0] + 1).clamp_(0).min().item()
+        low_j = (sample['xs'] - self.size[1] + 1).clamp_(0).min().item()
+        max_i = (sample['ys'] + sample['hs'] - 1).max().item()
+        max_j = (sample['xs'] + sample['ws'] - 1).max().item()
 
         # It has to contain at least 1 bounding box!
         while True:
             i, j, h, w = self.get_params(img, self.size, low_i=low_i, low_j=low_j,
                                          max_i=max_i, max_j=max_j)
-            if 'xs' not in sample or (sample.xs < 0.).all():
-                sample.imgs = F.crop(img, i, j, h, w)
-                return sample
-
-            new_xs = torch.clamp(sample.xs - j, min=0)
-            new_ys = torch.clamp(sample.ys - i, min=0)
+            new_xs = torch.clamp(sample['xs'] - j, min=0)
+            new_ys = torch.clamp(sample['ys'] - i, min=0)
             new_ws = torch.min(
-                ((sample.ws + sample.xs) - j).clamp_(min=0).sub_(new_xs),
+                ((sample['ws'] + sample['xs']) - j).clamp_(min=0).sub_(new_xs),
                 (w - new_xs))
             new_hs = torch.min(
-                ((sample.hs + sample.ys) - i).clamp_(min=0).sub_(new_ys),
+                ((sample['hs'] + sample['ys']) - i).clamp_(min=0).sub_(new_ys),
                 (h - new_ys))
 
             # At least 1 bounding box is included
@@ -83,11 +98,15 @@ class RandomCrop(tv.transforms.RandomCrop):
             else:
                 print('Not found at least 1 valid bbox. Re-crop.')
 
-        sample.xs = new_xs
-        sample.ys = new_ys
-        sample.ws = new_ws
-        sample.hs = new_hs
-        sample.imgs = F.crop(img, i, j, h, w)
+        sample['xs'] = new_xs
+        sample['ys'] = new_ys
+        sample['ws'] = new_ws
+        sample['hs'] = new_hs
+        sample['imgs'] = F.crop(img, i, j, h, w)
+        if 'masks' in sample and sample['masks'] is not None:
+            sample['masks'] = F.crop(sample['masks'], i, j, h, w)
+        if 'imgs_cf' in sample and sample['imgs_cf'] is not None:
+            sample['imgs_cf'] = F.crop(sample['imgs_cf'], i, j, h, w)
         return sample
 
     @staticmethod
@@ -113,28 +132,35 @@ class RandomCrop(tv.transforms.RandomCrop):
 
 class CenterCrop(tv.transforms.CenterCrop):
     def __call__(self, sample):
-        sample.imgs = F.center_crop(sample.imgs, self.size)
-        if 'xs' not in sample or (sample.xs < 0.).all():
+
+        sample['imgs'] = F.center_crop(sample['imgs'], self.size)
+        if 'masks' in sample and sample['masks'] is not None:
+            sample['masks'] = F.center_crop(sample['masks'], self.size)
+        if 'imgs_cf' in sample and sample['imgs_cf'] is not None:
+            sample['imgs_cf'] = F.center_crop(sample['imgs_cf'], self.size)
+
+        if ('masks' in sample and sample['masks'] is None) \
+                or ('masks' not in sample and ('xs' not in sample or (sample['xs'] < 0.).all())):
             return sample
 
-        image_width, image_height = sample.imgs.size
+        image_width, image_height = sample['imgs'].size
         h, w = self.size
         j = int(round((image_height - h) / 2.))
         i = int(round((image_width - w) / 2.))
 
-        new_xs = torch.clamp(sample.xs - j, min=0)
-        new_ys = torch.clamp(sample.ys - i, min=0)
+        new_xs = torch.clamp(sample['xs'] - j, min=0)
+        new_ys = torch.clamp(sample['ys'] - i, min=0)
         new_ws = torch.min(
-            ((sample.ws + sample.xs) - j).clamp_(min=0).sub_(new_xs),
+            ((sample['ws'] + sample['xs']) - j).clamp_(min=0).sub_(new_xs),
             (w - new_xs))
         new_hs = torch.min(
-            ((sample.hs + sample.ys) - i).clamp_(min=0).sub_(new_ys),
+            ((sample['hs'] + sample['ys']) - i).clamp_(min=0).sub_(new_ys),
             (h - new_ys))
 
-        sample.xs = new_xs
-        sample.ys = new_ys
-        sample.ws = new_ws
-        sample.hs = new_hs
+        sample['xs'] = new_xs
+        sample['ys'] = new_ys
+        sample['ws'] = new_ws
+        sample['hs'] = new_hs
         return sample
 
 
@@ -151,28 +177,23 @@ class Resize(tv.transforms.Resize):
             ``PIL.Image.BILINEAR``
     """
     def __call__(self, sample):
-        h, w = sample.imgs.height, sample.imgs.width
-        sample.imgs = F.resize(sample.imgs, self.size, self.interpolation)
-        if 'xs' not in sample or (sample.xs < 0.).all():
+
+        h, w = sample['imgs'].height, sample['imgs'].width
+        sample['imgs'] = F.resize(sample['imgs'], self.size, self.interpolation)
+        if 'masks' in sample and sample['masks'] is not None:
+            sample['masks'] = F.resize(sample['masks'], self.size, self.interpolation)
+        if 'imgs_cf' in sample and sample['imgs_cf'] is not None:
+            sample['imgs_cf'] = F.resize(sample['imgs_cf'], self.size, self.interpolation)
+
+        if ('masks' in sample and sample['masks'] is None) \
+                or ('masks' not in sample and ('xs' not in sample or (sample['xs'] < 0.).all())):
             return sample
 
-        new_h, new_w = sample.imgs.height, sample.imgs.width
-        sample.xs, sample.ys, sample.ws, sample.hs = self.resize_bbox(
+        new_h, new_w = sample['imgs'].height, sample['imgs'].width
+        sample['xs'], sample['ys'], sample['ws'], sample['hs'] = self.resize_bbox(
             w, h, new_w, new_h,
-            sample.xs, sample.ys, sample.ws, sample.hs)
+            sample['xs'], sample['ys'], sample['ws'], sample['hs'])
 
-        # has_bbox = (sample.xs >= 0)
-        # new_h, new_w = sample.imgs.height, sample.imgs.width
-        #
-        # old_xs, old_ys = sample.xs.clone(), sample.ys.clone()
-        # sample.xs.mul_(new_w).floor_divide_(w)
-        # sample.ys.mul_(new_h).floor_divide_(h)
-        # # To be exact for w and h, we calculate the post-coordinate
-        # # and round the coordinate to get width / height.
-        # sample.ws.add_(old_xs).mul_(new_w).floor_divide_(w).add_(1).sub_(sample.xs)
-        # sample.hs.add_(old_ys).mul_(new_h).floor_divide_(h).add_(1).sub_(sample.ys)
-
-        # sample.xs[~has_bbox] = -1
         return sample
 
     @staticmethod
@@ -191,36 +212,59 @@ class RandomHorizontalFlip(tv.transforms.RandomHorizontalFlip):
         if random.random() >= self.p:
             return sample
 
-        sample.imgs = F.hflip(sample.imgs)
-        if 'xs' not in sample or (sample.xs < 0.).all():
+        sample['imgs'] = F.hflip(sample['imgs'])
+        if 'masks' in sample and sample['masks'] is not None:
+            sample['masks'] = F.hflip(sample['masks'])
+        if 'imgs_cf' in sample and sample['imgs_cf'] is not None:
+            sample['imgs_cf'] = F.hflip(sample['imgs_cf'])
+
+        if ('masks' in sample and sample['masks'] is None) \
+                or ('masks' not in sample and ('xs' not in sample or (sample['xs'] < 0.).all())):
             return sample
 
-        h, w = sample.imgs.height, sample.imgs.width
-        sample.xs.add_(sample.ws).neg_().add_(w)
+        h, w = sample['imgs'].height, sample['imgs'].width
+        sample['xs'].add_(sample['ws']).neg_().add_(w)
         return sample
 
 
 class ColorJitter(tv.transforms.ColorJitter):
     def __call__(self, sample):
-        sample.imgs = super().__call__(sample.imgs)
+        transform = self.get_params(self.brightness, self.contrast,
+                                    self.saturation, self.hue)
+        sample['imgs'] = transform(sample['imgs'])
+        if 'imgs_cf' in sample and sample['imgs_cf'] is not None:
+            sample['imgs_cf'] = transform(sample['imgs_cf'])
         return sample
 
 
 class ToTensor(tv.transforms.ToTensor):
     def __call__(self, sample):
-        sample.imgs = super().__call__(sample.imgs)
+        sample['imgs'] = super().__call__(sample['imgs'])
+        if 'imgs_cf' in sample and sample['imgs_cf'] is not None:
+            sample['imgs_cf'] = super().__call__(sample['imgs_cf'])
+
+        if 'masks' in sample and sample['masks'] is not None:
+            sample['masks'] = super().__call__(sample['masks'])
+            # Ceil the masks since PIL is not easy to operate
+            sample['masks'].ceil_()
+            sample['masks'] = (sample['masks'] == 1).any(dim=0, keepdims=True).float()
+
         return sample
 
 
 class Normalize(tv.transforms.Normalize):
     def __call__(self, sample):
-        sample.imgs = super().__call__(sample.imgs)
+        sample['imgs'] = super().__call__(sample['imgs'])
+        if 'imgs_cf' in sample and sample['imgs_cf'] is not None:
+            sample['imgs_cf'] = super().__call__(sample['imgs_cf'])
         return sample
 
 
 class Grayscale(tv.transforms.Grayscale):
     def __call__(self, sample):
-        sample.imgs = super().__call__(sample.imgs)
+        sample['imgs'] = super().__call__(sample['imgs'])
+        if 'imgs_cf' in sample and sample['imgs_cf'] is not None:
+            sample['imgs_cf'] = super().__call__(sample['imgs_cf'])
         return sample
 
 

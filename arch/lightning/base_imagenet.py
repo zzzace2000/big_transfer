@@ -22,16 +22,27 @@ from ..data import bbox_utils
 from ..data.imagenet_datasets import MyImagenetBoundingBoxFolder, MyImageFolder, MyConcatDataset, MySubset, \
     MyImageNetODataset, MyFactualAndCFDataset
 from ..inpainting.VAEInpainter import VAEInpainter
-from ..utils import output_csv, DotDict
+from ..utils import output_csv, DotDict, generate_mask
 from ..saliency_utils import get_grad_y, get_grad_sum, \
     get_grad_logp_sum, get_grad_logp_y, get_deeplift, get_grad_cam
 from .base import BaseLightningModel
 
 
+KNOWN_NUM_CLASSES = {
+    'imageneta': 200,
+    'objectnet': 113,
+}
+
+
 class ImageNetLightningModel(BaseLightningModel):
     def init_setup(self):
+        if 'lr_steps' not in self.hparams:
+            self.hparams.lr_steps = 10000
+
         # setup the learning rate schedule for how long we want to train
-        self.lr_supports = [500, 3000, 6000, 9000, 10_000]
+        self.lr_supports = [
+            int(r * self.hparams.lr_steps) for r in [0.05, 0.3, 0.6, 0.9, 1.0]
+        ]
 
         if self.hparams.model in models.KNOWN_MODELS:
             self.model = models.KNOWN_MODELS[self.hparams.model](
@@ -52,127 +63,11 @@ class ImageNetLightningModel(BaseLightningModel):
             self.my_logger.info('Already finish training! Exit!')
             exit()
 
-    def training_step(self, batch, batch_idx):
-        return self._training_step(batch, batch_idx)
-
-    def _training_step(self, batch, batch_idx, is_training=True):
-        x, y = batch
-
-        is_dict = isinstance(x, dict)
-        if is_dict:
-            if 'imgs_cf' in x:
-                bbox = {k: x[k] for k in ['xs', 'ys', 'ws', 'hs']}
-                x = torch.cat([x['imgs'], x['imgs_cf']], dim=0)
-                y = torch.cat([y, (-y - 1)], dim=0)
-                mask = lambda imgs: self._generate_mask(imgs, **bbox) # lazy loading
-            else:
-                mask = self._generate_mask(
-                    x['imgs'], x['xs'], x['ys'], x['ws'], x['hs'])
-                if self.hparams.inpaint == 'none':
-                    x = x['imgs']
-                else:
-                    impute_x = self.inpaint_model(x['imgs'], mask)
-                    impute_y = (-y - 1)
-
-                    x = torch.cat([x['imgs'], impute_x], dim=0)
-                    # label -1 as negative of class 0, -2 as negative of class 1 etc...
-                    y = torch.cat([y, impute_y], dim=0)
-
-        if self.hparams.get('reg', 'none') == 'none':
-            logits = self(x)
-            reg_loss = logits.new_tensor(0.)
-        else:
-            if is_dict and self.hparams.inpaint != 'none':
-                half = len(x) // 2
-                x_orig, x_cf, y_orig = x[:half], x[half:], y[:half]
-            else:
-                x_orig, y_orig = x, y
-
-            saliency_fn = eval(f"get_{self.hparams.get('reg_grad', 'grad_y')}")
-            the_grad, logits = saliency_fn(x_orig, y_orig, self.model,
-                                           is_training=is_training)
-            if torch.all(the_grad == 0.):
-                reg_loss = logits.new_tensor(0.)
-            elif self.hparams.reg == 'gs':
-                assert is_dict and self.hparams.inpaint != 'none'
-                dist = x_orig.detach() - x_cf
-                cos_sim = self.my_cosine_similarity(the_grad, dist)
-
-                reg_loss = (1. - cos_sim).mean().mul_(self.hparams.reg_coeff)
-            elif self.hparams.reg == 'bbox_o': # 'bbox_o'
-                # a simple loss that the saliency outside of the box is bad
-                if callable(mask):
-                    mask = mask(x_orig)
-
-                reg_loss = ((the_grad * mask) ** 2).mean()\
-                    .mul_(self.hparams.reg_coeff)
-            elif self.hparams.reg == 'bbox_f1':
-                if callable(mask):
-                    mask = mask(x_orig)
-                norm = (the_grad ** 2).sum(dim=1, keepdim=True)
-                norm = (norm - norm.min()) / norm.max()
-                gnd_truth = (1. - mask)
-
-                f1 = self.diff_f1_score(norm, gnd_truth)
-                # (1 - F1) as the loss
-                reg_loss = (1. - f1).mul_(self.hparams.reg_coeff)
-            else:
-                raise NotImplementedError(self.hparams.reg)
-
-            # Doing annealing
-            if self.hparams.reg_anneal > 0. \
-                    and self.global_step < \
-                    self.hparams.reg_anneal * self.lr_supports[-1]:
-                reg_loss *= (self.global_step / self.lr_supports[-1]
-                             / self.hparams.reg_anneal)
-
-            if is_dict and self.hparams.inpaint != 'none':
-                cf_logits = self(x_cf)
-                logits = torch.cat([logits, cf_logits], dim=0)
-
-        c, c_cf = self.counterfact_cri(logits, y)
-        c_cf *= self.hparams.cf_coeff
-
-        # See clean img accuracy and cf img accuracy
-        if not is_dict:
-            acc1, acc5 = self.accuracy(logits, y, topk=(1, 5))
-            cf_acc1, cf_acc5 = acc1.new_tensor(-1.), acc1.new_tensor(-1.)
-        else:
-            acc1, acc5 = self.accuracy(
-                logits[:(len(y)//2)], y[:(len(y)//2)], topk=(1, 5))
-
-            cf_y = -(y[(len(y)//2):] + 1)
-            cf_acc1, cf_acc5 = self.accuracy(
-                logits[(len(y)//2):], cf_y, topk=(1, 5))
-            cf_acc1, cf_acc5 = 100. - cf_acc1, 100. - cf_acc5
-
-        # Check NaN
-        for name, metric in [
-            ('train_loss', c),
-            ('reg_loss', reg_loss),
-        ]:
-            if torch.isnan(metric).all():
-                raise RuntimeError(f'metric {name} is Nan')
-
-        tqdm_dict = {'train_loss': c, 'reg_loss': reg_loss, 'train_acc1': acc1, 'train_acc5': acc5,
-                     **({} if not is_dict
-                        else {'train_cf_acc1': cf_acc1, 'train_cf_acc5': cf_acc5})}
-        output = OrderedDict({
-            'loss': c + reg_loss,
-            'train_loss': c,
-            'reg_loss': reg_loss,
-            'acc1': acc1,
-            'acc5': acc5,
-            'cf_acc1': cf_acc1,
-            'cf_acc5': cf_acc5,
-            'progress_bar': tqdm_dict,
-            'log': tqdm_dict,
-        })
-        return output
-
-    def validation_step(self, batch, batch_idx, dataloader_idx=None):
-        if dataloader_idx is None or dataloader_idx == 0:
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        if dataloader_idx in [0, 1]:
             images, target = batch
+            if isinstance(images, dict):
+                images = images['imgs']
 
             output = self(images)
             loss_val = F.cross_entropy(output, target, reduction='sum')
@@ -180,25 +75,10 @@ class ImageNetLightningModel(BaseLightningModel):
             batch_size = images.new_tensor(images.shape[0])
 
             output = OrderedDict({
-                'val_loss': loss_val,
-                'val_acc1': acc1 * batch_size,
-                'val_acc5': acc5 * batch_size,
+                'loss': loss_val,
+                'acc1': acc1 * batch_size,
+                'acc5': acc5 * batch_size,
                 'batch_size': batch_size,
-            })
-            return output
-
-        # handle the second loader for part of the train loader
-        # since counting cf size is annoying, just take avg
-        if dataloader_idx == 1:
-            result = self._training_step(batch, batch_idx,
-                                         is_training=False)
-            output = OrderedDict({
-                'val_loss': result['train_loss'],
-                'val_reg_loss': result['reg_loss'],
-                'val_acc1': result['acc1'],
-                'val_acc5': result['acc5'],
-                'val_cf_acc1': result['cf_acc1'],
-                'val_cf_acc5': result['cf_acc5'],
             })
             return output
 
@@ -217,22 +97,16 @@ class ImageNetLightningModel(BaseLightningModel):
     def validation_epoch_end(self, outputs):
         tqdm_dict = {}
 
-        # 1st val loader
-        the_outputs = outputs if isinstance(outputs[0], dict) else outputs[0]
-        all_size = torch.stack([o['batch_size'] for o in the_outputs]).sum()
-        for metric_name in ["val_loss", "val_acc1", "val_acc5"]:
-            metrics = [o[metric_name] for o in the_outputs]
-            tqdm_dict[metric_name] = torch.sum(torch.stack(metrics)) / all_size
-
-        # 2nd val loader
-        if isinstance(outputs[0], list) and len(outputs) > 1:
-            the_outputs = outputs[1]
-            for metric_name in ["val_loss", "val_reg_loss", "val_acc1",
-                                "val_acc5", "val_cf_acc1", "val_cf_acc5"]:
+        def cal_output(the_outputs, the_prefix):
+            all_size = torch.stack([o['batch_size'] for o in the_outputs]).sum()
+            for metric_name in ["loss", "acc1", "acc5"]:
                 metrics = [o[metric_name] for o in the_outputs]
-                metrics = torch.stack(metrics)
-                metrics = metrics[metrics >= 0.] # filter out neg value
-                tqdm_dict[metric_name + '_train'] = metrics.mean()
+                tqdm_dict['%s_%s' % (the_prefix, metric_name)] = \
+                    torch.sum(torch.stack(metrics)) / all_size
+
+        # 1st val loader
+        cal_output(outputs[0], 'test')
+        cal_output(outputs[1], 'val')
 
         # 3rd val loader
         if isinstance(outputs[0], list) and len(outputs) > 2:
@@ -248,17 +122,6 @@ class ImageNetLightningModel(BaseLightningModel):
             'val_loss': tqdm_dict["val_loss"],
             'gstep': self.global_step, # checkpoint filename
         }
-
-        # Record it in the last training step
-        if self.global_step >= self.lr_supports[-1] - 1:
-            csv_dict = OrderedDict()
-            csv_dict['name'] = self.hparams.name
-            csv_dict.update(tqdm_dict)
-            csv_dict.update(
-                vars(self.hparams) if isinstance(self.hparams, Namespace)
-                else self.hparams)
-            output_csv(pjoin(self.hparams.result_dir, 'results.csv'), csv_dict)
-
         return result
 
     def configure_optimizers(self):
@@ -276,26 +139,10 @@ class ImageNetLightningModel(BaseLightningModel):
         }
         return [optimizer], [scheduler]
 
-    def _setup_loaders(self):
-        train_set, valid_sets = self._make_train_val_dataset()
-        self.my_logger.info(f"Using a training set with {len(train_set)} images.")
-        for idx, v in enumerate(valid_sets):
-            self.my_logger.info(f"Using a validation set {idx} with {len(v)} images.")
-
-        train_bs = self.hparams.batch // self.hparams.batch_split
-        val_bs = train_bs
-        if 'val_batch' in self.hparams:
-            val_bs = self.hparams.val_batch // self.hparams.batch_split
-        self.train_loader = train_set.make_loader(
-            train_bs, shuffle=True, workers=self.hparams.workers)
-        self.valid_loaders = [v.make_loader(
-            val_bs, shuffle=False, workers=self.hparams.workers)
-            for v in valid_sets]
-
     def _make_train_val_dataset(self):
         precrop, crop = bit_hyperrule.get_resolution_from_dataset(self.hparams.dataset)
         if self.hparams.test_run:  # save memory
-            precrop, crop = 64, 56
+            precrop, crop = 32, 28
 
         train_tx = tv.transforms.Compose([
             tv.transforms.Resize((precrop, precrop)),
@@ -333,30 +180,30 @@ class ImageNetLightningModel(BaseLightningModel):
                 bbox_utils.ToTensor(),
                 bbox_utils.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
             ])
-            if self.hparams.inpaint == 'none' and self.hparams.reg == 'none':
+            if self.hparams.inpaint == 'none' and self.hparams.reg == 'none' \
+                    and self.hparams.f_inpaint == 'none':
                 bbox_d = MyImageFolder(
                     pjoin(self.hparams.datadir, f"train_{self.hparams.dataset}"),
                     is_valid_file=has_bbox(self.hparams.bbox_max_ratio),
                     transform=train_tx)
             else:
+                cf_inpaint_dir = None
+                if self.hparams.inpaint == 'cagan':
+                    cf_inpaint_dir = \
+                        pjoin(self.hparams.datadir, f"train_cagan_{self.hparams.dataset}")
                 bbox_d = MyImagenetBoundingBoxFolder(
                     pjoin(self.hparams.datadir, f"train_{self.hparams.dataset}"),
                     bbox_file=pjoin(self.hparams.datadir, 'LOC_train_solution.csv'),
                     is_valid_file=has_bbox(self.hparams.bbox_max_ratio),
+                    cf_inpaint_dir=cf_inpaint_dir,
                     transform=train_bbox_tx)
-                if self.hparams.inpaint == 'cagan':
-                    cagan_d = MyImageFolder(
-                        pjoin(self.hparams.datadir, f"train_cagan_{self.hparams.dataset}"),
-                        is_valid_file=has_bbox(self.hparams.bbox_max_ratio),
-                        transform=train_tx)
-                    bbox_d = MyFactualAndCFDataset(bbox_d, cagan_d)
 
             bbox_d, _ = self.sub_dataset(bbox_d, self.hparams.bbox_data)
+            self.my_logger.info(f"W/ bbox total examples are {len(bbox_d)}")
             train_sets.append(bbox_d)
 
         # handle no bbox dataset
         bbox_len = 0. if len(train_sets) == 0 else sum([len(d) for d in train_sets])
-        self.my_logger.info(f"bbox length {bbox_len}")
         if self.hparams.nobbox_data > 0.:
             nobbox_d = MyImageFolder(
                 pjoin(self.hparams.datadir, f"train_{self.hparams.dataset}"),
@@ -368,7 +215,7 @@ class ImageNetLightningModel(BaseLightningModel):
                 assert self.hparams.bbox_data > 0.
                 nobbox_data = int(bbox_len * nobbox_data)
             nobbox_d, _ = self.sub_dataset(nobbox_d, nobbox_data)
-            self.my_logger.info(f"nobbox length {len(nobbox_d)}")
+            self.my_logger.info(f"W/o bbox total examples are {len(nobbox_d)}")
             train_sets.append(nobbox_d)
 
         train_set = train_sets[0] if len(train_sets) == 1 \
@@ -403,11 +250,11 @@ class ImageNetLightningModel(BaseLightningModel):
             (self.hparams.batch * (self.lr_supports[-1]))
         return train_set, valid_sets
 
-    def get_inpainting_model(self):
-        if self.hparams.inpaint == 'cagan':
+    def get_inpainting_model(self, inpaint):
+        if inpaint == 'cagan':
             return None
 
-        if self.hparams.inpaint == 'vae':
+        if inpaint == 'vae':
             inpaint_model = VAEInpainter(in_mean=(0.5, 0.5, 0.5), in_std=(0.5, 0.5, 0.5))
             gen_model_path = './inpainting_models/0928-VAE-Var-hole_lr_0.0002_epochs_7'
             inpaint_model.load_state_dict(
@@ -415,15 +262,17 @@ class ImageNetLightningModel(BaseLightningModel):
                 strict=False)
             return inpaint_model
 
-        return super().get_inpainting_model()
+        return super().get_inpainting_model(inpaint)
 
     @classmethod
     def add_model_specific_args(cls, parser):  # pragma: no-cover
         parser.add_argument("--bbox_data", type=float, default=1.0)
-        parser.add_argument("--bbox_max_ratio", type=float, default=1.)
-        parser.add_argument("--nobbox_data", type=float, default=0.)
+        parser.add_argument("--bbox_max_ratio", type=float, default=0.5)
+        parser.add_argument("--nobbox_data", type=float, default=1.)
 
-        parser.add_argument("--batch", type=int, default=128,
+        parser.add_argument("--batch", type=int, default=32,
+                            help="Batch size.")
+        parser.add_argument("--val_batch", type=int, default=256,
                             help="Batch size.")
         parser.add_argument("--batch_split", type=int, default=1,
                             help="Number of batches to compute gradient on before updating weights.")
@@ -436,6 +285,7 @@ class ImageNetLightningModel(BaseLightningModel):
         parser.add_argument("--test_data", type=float, default=2000)
         parser.add_argument("--pl_model", type=str, default=cls.__name__)
         parser.add_argument("--reg_anneal", type=float, default=0.)
+        parser.add_argument("--lr_steps", type=int, default=10000)
         return parser
 
     def pl_trainer_args(self):
@@ -445,6 +295,8 @@ class ImageNetLightningModel(BaseLightningModel):
             save_last=True,
             period=-1,  # -1 then it saves checkpts within an epoch
             verbose=True,
+            monitor='val_acc1',
+            mode='max',
         )
 
         val_check_interval = self.hparams.eval_every
@@ -452,11 +304,22 @@ class ImageNetLightningModel(BaseLightningModel):
             val_check_interval *= self.hparams.batch_split
 
         args = dict()
-        args['max_steps'] = (self.lr_supports[-1] - self.global_step - 1)
+        args['max_steps'] = self.lr_supports[-1]
         args['val_check_interval'] = val_check_interval
         args['checkpoint_callback'] = checkpoint_callback
-
         last_ckpt = pjoin(self.hparams.logdir, self.hparams.name, 'last.ckpt')
         if pexists(last_ckpt):
             args['resume_from_checkpoint'] = last_ckpt
+
         return args
+
+    def is_finished_run(self):
+        last_ckpt = pjoin(self.hparams.logdir, self.hparams.name, 'last.ckpt')
+        if pexists(last_ckpt):
+            last_gstep = torch.load(last_ckpt)['global_step']
+            if last_gstep >= (self.lr_supports[-1] - 1):
+                print('Already finish fitting! Max %d Last %d'
+                      % (self.lr_supports[-1], last_gstep))
+                return True
+
+        return False

@@ -9,7 +9,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score, f1_score
 from sklearn.calibration import calibration_curve
 import numpy as np
 
-from .xray import XRayLightningModel
+from .base import EpochBaseLightningModel
 from ..data.cct_datasets import MyCCT_Dataset
 from .. import models
 from ..data.imagenet_datasets import MySubset, MyConcatDataset
@@ -17,7 +17,7 @@ from ..saliency_utils import get_grad_y, get_grad_sum, \
     get_grad_logp_sum, get_grad_logp_y, get_deeplift
 
 
-class CCTLightningModel(XRayLightningModel):
+class CCTLightningModel(EpochBaseLightningModel):
     def init_setup(self):
         # Resnet 50
         self.model = models.KNOWN_MODELS['BiT-S-R50x1'](
@@ -31,6 +31,11 @@ class CCTLightningModel(XRayLightningModel):
         # self.model.fc = torch.nn.Linear(2048, 15, bias=True)
         # torch.nn.init.zeros_(self.model.fc.weight)
         # torch.nn.init.zeros_(self.model.fc.bias)
+
+    def get_inpainting_model(self, inpaint):
+        if inpaint == 'cagan':
+            return None
+        return super().get_inpainting_model(inpaint)
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         x, y = batch
@@ -102,6 +107,12 @@ class CCTLightningModel(XRayLightningModel):
         }
         return result
 
+    def val_dataloader(self):
+        if self.valid_loaders is None:
+            self._setup_loaders()
+        # Only return the validation set!
+        return self.valid_loaders
+
     def configure_optimizers(self):
         optim = torch.optim.RMSprop(
             self.model.parameters(), lr=self.hparams.base_lr,
@@ -124,8 +135,13 @@ class CCTLightningModel(XRayLightningModel):
     #     return F.cross_entropy(logit, cf_y, reduction=reduction)
 
     def _make_train_val_dataset(self):
+        cf_inpaint_dir = None
+        if self.hparams.inpaint == 'cagan':
+            cf_inpaint_dir = '../datasets/cct/cagan/'
+
         train_d = MyCCT_Dataset(
             '../datasets/cct/eccv_18_annotation_files/train_annotations.json',
+            cf_inpaint_dir=cf_inpaint_dir,
             transform=MyCCT_Dataset.get_train_bbox_transform()
         )
         val_d = MyCCT_Dataset(
@@ -163,13 +179,12 @@ class CCTLightningModel(XRayLightningModel):
             save_last=True,
             verbose=True,
             mode='max',
-            monitor='val_acc1',
+            monitor='val_auc',
         )
 
         args = dict()
         args['max_epochs'] = self.hparams.max_epochs
         args['checkpoint_callback'] = checkpoint_callback
-
         last_ckpt = pjoin(self.hparams.logdir, self.hparams.name, 'last.ckpt')
         if pexists(last_ckpt):
             args['resume_from_checkpoint'] = last_ckpt
