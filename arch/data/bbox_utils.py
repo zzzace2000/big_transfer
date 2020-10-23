@@ -266,7 +266,3 @@ class Grayscale(tv.transforms.Grayscale):
         if 'imgs_cf' in sample and sample['imgs_cf'] is not None:
             sample['imgs_cf'] = super().__call__(sample['imgs_cf'])
         return sample
-
-
-# NIH dataset loader!!!
-# https://github.com/mlmed/torchxrayvision/blob/master/torchxrayvision/datasets.py#L867

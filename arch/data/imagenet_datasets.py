@@ -183,7 +183,7 @@ class MyImageFolder(MyHackSampleSizeMixin, ImageFolder):
         return train_bbox_tx
 
     @classmethod
-    def get_val_transform(self, test_run=False):
+    def get_val_transform(cls, test_run=False):
         cut = 14 if test_run else 224
 
         val_bbox_tx = tv.transforms.Compose([
@@ -286,17 +286,15 @@ class MyConcatDatasetSampler(Sampler):
         self.batch_size = batch_size
         self.my_num_samples = my_num_samples
         self.batch_len = int(sum([
-            len(d) // (batch_size / 2 if d.is_bbox_folder else batch_size)
+            len(d) // batch_size
             for d in self.data_source.datasets]))
         self.gen_func = torch.randperm if shuffle else torch.arange
 
     def __iter__(self):
         cs = self.data_source.cumulative_sizes
 
-        def idxes_generator(s, e, dataset):
-            bs = self.batch_size // 2 \
-                if dataset.is_bbox_folder \
-                else self.batch_size
+        def idxes_generator(s, e):
+            bs = self.batch_size
             idxes = self.gen_func(e - s) + s
 
             for s in range(0, len(idxes), bs):
@@ -305,8 +303,8 @@ class MyConcatDatasetSampler(Sampler):
         while True:
             # randomly sample batch from each dataset
             generators = [
-                iter(idxes_generator(s, e, dataset))
-                for s, e, dataset in zip([0] + cs[:-1], cs, self.data_source.datasets)
+                iter(idxes_generator(s, e))
+                for s, e in zip([0] + cs[:-1], cs)
             ]
             while len(generators) > 0:
                 g_idx = random.randint(0, len(generators) - 1)

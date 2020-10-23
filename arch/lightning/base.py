@@ -15,7 +15,7 @@ import torch.utils.data.distributed
 import torch.utils.data.distributed
 import torchvision as tv
 from pytorch_lightning.core import LightningModule
-from sklearn.metrics import average_precision_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 from .. import models, bit_common, bit_hyperrule
@@ -243,7 +243,7 @@ class BaseLightningModel(LightningModule):
 
         cf_y = -(y + 1)
         if self.hparams.cf == 'uni': # uniform prob
-            loss = F.log_softmax(logit, dim=1).mean(dim=1)
+            loss = -F.log_softmax(logit, dim=1).mean(dim=1)
         elif self.hparams.cf == 'uni_e': # uniform prob except the cls
             logp = F.log_softmax(logit, dim=1)
             weights = torch.ones_like(logp).mul_(1. / (
@@ -370,6 +370,75 @@ class BaseLightningModel(LightningModule):
 
         return inpaint_model
 
+    def test_dataloader(self):
+        '''
+        This is for OOD detections. The first loader is the normal
+        test set. And the rest of the loaders are from other datasets
+        like Gaussian, Uniform, CCT and Xray.
+
+        Gaussian, Uniform: generate the same number as test sets (45k)
+        CCT: whole dataset like 45k?
+        Xray: 30k?
+        '''
+        test_sets = self._make_test_datasets()
+        if test_sets is None:
+            return None
+
+        for idx, (n, v) in enumerate(zip(self.test_sets_names, test_sets)):
+            self.my_logger.info(f"Using a test set {idx} {n} with {len(v)} images.")
+
+        test_loaders = [v.make_loader(
+            self.hparams.val_batch, shuffle=False, workers=self.hparams.workers)
+            for v in test_sets]
+        return test_loaders
+
+    def test_step(self, batch, batch_idx, dataloader_idx=0):
+        x, y = batch
+        if isinstance(x, dict):
+            x = x['imgs']
+
+        logits = self(x)
+        prob = F.softmax(logits, dim=1)
+        anomaly_score = 1. - (prob.max(dim=1).values)
+
+        output = {
+            'anomaly_score': anomaly_score,
+        }
+        return output
+
+    def test_epoch_end(self, outputs):
+        tqdm_dict = {}
+
+        def cal_metrics(the_test, the_orig, prefix='gn'):
+            the_as = torch.cat([o['anomaly_score'] for o in the_test])
+            orig_as = torch.cat([o['anomaly_score'] for o in the_orig])
+
+            # 95% TPR: k is the kth-smallest element
+            # I want 95% of examples to below this number
+            thresh = torch.kthvalue(
+                orig_as,
+                k=int(np.floor(0.95 * len(orig_as)))).values
+            fpr = (the_as <= thresh).float().mean().item()
+            tqdm_dict[f'{prefix}_ood_fpr'] = fpr
+
+            cat_as = torch.cat([the_as, orig_as], dim=0)
+            ys = torch.cat([torch.ones(len(the_as)), torch.zeros(len(orig_as))], dim=0)
+            tqdm_dict[f'{prefix}_ood_auc'] = roc_auc_score(
+                ys.cpu().numpy(), cat_as.cpu().numpy())
+            tqdm_dict[f'{prefix}_ood_aupr'] = average_precision_score(
+                ys.cpu().numpy(), cat_as.cpu().numpy())
+
+        for name, output in zip(self.test_sets_names[1:], outputs[1:]):
+            cal_metrics(output, outputs[0], name)
+
+        result = {
+            'progress_bar': tqdm_dict, 'log': tqdm_dict,
+        }
+        return result
+
+    def _make_test_datasets(self):
+        raise None
+
     @classmethod
     def add_model_specific_args(cls, parser):  # pragma: no-cover
         raise NotImplementedError()
@@ -377,18 +446,23 @@ class BaseLightningModel(LightningModule):
     def pl_trainer_args(self):
         raise NotImplementedError()
 
-    def is_finished_run(self):
+    @classmethod
+    def is_finished_run(cls, model_dir):
         raise NotImplementedError()
 
 
 class EpochBaseLightningModel(BaseLightningModel):
-    def is_finished_run(self):
-        last_ckpt = pjoin(self.hparams.logdir, self.hparams.name, 'last.ckpt')
+    @classmethod
+    def is_finished_run(cls, model_dir):
+        last_ckpt = pjoin(model_dir, 'last.ckpt')
         if pexists(last_ckpt):
-            last_epoch = torch.load(last_ckpt)['epoch']
-            if last_epoch >= self.hparams.max_epochs:
+            tmp = torch.load(last_ckpt,
+                             map_location=torch.device('cpu'))
+            last_epoch = tmp['epoch']
+            hparams = tmp['hyper_parameters']
+            if last_epoch >= hparams.max_epochs:
                 print('Already finish fitting! Max %d Last %d'
-                      % (self.hparams.max_epochs, last_epoch))
+                      % (hparams.max_epochs, last_epoch))
                 return True
 
         return False

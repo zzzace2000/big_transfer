@@ -52,7 +52,9 @@ def get_args():
                         help='supports three options dp, ddp, ddp2')
     parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                         help='evaluate model on validation set')
-    parser.add_argument("--name", default='test',
+    parser.add_argument("--name",
+                        default='test',
+                        # default='0930_in9_seg_random_s5',
                         help="Name of this run. Used for monitoring and checkpointing.")
     parser.add_argument("--model", default='BiT-S-R50x1',
                         help="Which variant to use; BiT-M gives best results.")
@@ -63,7 +65,7 @@ def get_args():
     parser.add_argument("--workers", type=int, default=8,
                         help="Number of background threads used to load data.")
     # My own arguments
-    parser.add_argument("--dataset", default='imageneta',
+    parser.add_argument("--dataset", default='in9',
                         help="Choose the dataset. It should be easy to add your own! "
                              "Don't forget to set --datadir if necessary.",
                         choices=['objectnet', 'imageneta', 'xray', 'cct', 'in9', 'in9l'])
@@ -87,26 +89,33 @@ def get_args():
 
     temp_args, _ = parser.parse_known_args()
 
-    # setup which lightning model to use
-    if temp_args.dataset in ['objectnet', 'imageneta']:
-        temp_args.pl_model = ImageNetLightningModel.__name__
-    elif temp_args.dataset == 'xray':
-        temp_args.pl_model = XRayLightningModel.__name__
-    elif temp_args.dataset == 'cct':
-        temp_args.pl_model = CCTLightningModel.__name__
-    elif temp_args.dataset == 'in9':
-        temp_args.pl_model = IN9LightningModel.__name__
-    elif temp_args.dataset == 'in9l':
-        temp_args.pl_model = IN9LLightningModel.__name__
+    # If model directory exists, just use the hparams saved in the original directory
+    saved_hparams = pjoin('models', temp_args.name, 'hparams.json')
+    if pexists(saved_hparams) and temp_args.test_run == 0:
+        print('Reload from the previous run hyperparameter!')
+        hparams = json.load(open(saved_hparams))
+        args = Namespace(**hparams)
     else:
-        raise NotImplementedError(temp_args.dataset)
+        # setup which lightning model to use
+        if temp_args.dataset in ['objectnet', 'imageneta']:
+            temp_args.pl_model = ImageNetLightningModel.__name__
+        elif temp_args.dataset == 'xray':
+            temp_args.pl_model = XRayLightningModel.__name__
+        elif temp_args.dataset == 'cct':
+            temp_args.pl_model = CCTLightningModel.__name__
+        elif temp_args.dataset == 'in9':
+            temp_args.pl_model = IN9LightningModel.__name__
+        elif temp_args.dataset == 'in9l':
+            temp_args.pl_model = IN9LLightningModel.__name__
+        else:
+            raise NotImplementedError(temp_args.dataset)
 
-    parser = eval(temp_args.pl_model).add_model_specific_args(parser)
-    args = parser.parse_args()
+        parser = eval(temp_args.pl_model).add_model_specific_args(parser)
+        args = parser.parse_args()
 
-    args.logdir = './models/'
-    args.result_dir = './results/'
-    os.makedirs(args.result_dir, exist_ok=True)
+        args.logdir = './models/'
+        args.result_dir = './results/'
+        os.makedirs(args.result_dir, exist_ok=True)
 
     # on v server
     if not pexists(pjoin(args.logdir, args.name)) \
@@ -139,6 +148,7 @@ def get_args():
         args.eval_every = 100
         if args.dataset.startswith('in9'):
             args.mask = 'seg'
+            args.data_ratio = 1.2
         if args.dataset.startswith('imageneta'):
             args.nobbox_data = 1.
 
@@ -173,8 +183,8 @@ def main(args: Namespace) -> None:
         precision=16 if args.fp16 else 32,
         amp_level='O1',
         profiler=True,
-        # num_sanity_val_steps=1,
-        num_sanity_val_steps=1 if args.test_run else 0,
+        num_sanity_val_steps=1,
+        # num_sanity_val_steps=1 if args.test_run else 0,
         accumulate_grad_batches=args.batch_split,
         logger=logger,
         benchmark=(args.seed is None),
@@ -188,12 +198,12 @@ def main(args: Namespace) -> None:
     default_args.update(model.pl_trainer_args())
 
     trainer = pl.Trainer(**default_args)
-    if not model.is_finished_run():
-        trainer.fit(model)
+    if not model.is_finished_run(pjoin(args.logdir, args.name)):
+        # Record hyperparameters
+        json.dump(vars(args),
+                  open(pjoin(args.logdir, args.name, 'hparams.json'), 'w'))
 
-    # Record hyperparameters
-    json.dump(vars(args),
-              open(pjoin(args.logdir, args.name, 'hparams.json'), 'w'))
+        trainer.fit(model)
 
     # Run the test set if defined in lightning model
     gave_test_loader = hasattr(model, 'test_dataloader') and \

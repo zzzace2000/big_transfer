@@ -11,6 +11,9 @@ import numpy as np
 
 from .base import EpochBaseLightningModel
 from ..data.cct_datasets import MyCCT_Dataset
+from ..data.imagenet_datasets import MyImageFolder
+from ..data.simulated_datasets import GaussianNoiseDataset, UniformNoiseDataset
+from ..data.xrayvision_datasets import Kaggle_Dataset
 from .. import models
 from ..data.imagenet_datasets import MySubset, MyConcatDataset
 from ..saliency_utils import get_grad_y, get_grad_sum, \
@@ -157,6 +160,30 @@ class CCTLightningModel(EpochBaseLightningModel):
             transform=MyCCT_Dataset.get_val_bbox_transform()
         )
         return train_d, [val_d, cis_test_d, trans_test_d]
+
+    # def _make_test_datasets(self):
+    #     orig_test_d = MyCCT_Dataset(
+    #         '../datasets/cct/eccv_18_annotation_files/test_annotations.json',
+    #         transform=MyCCT_Dataset.get_val_bbox_transform()
+    #     )
+    #
+    #     gn_d = GaussianNoiseDataset(num_samples=len(orig_test_d))
+    #     un_d = UniformNoiseDataset(num_samples=len(orig_test_d))
+    #     imgnet_d = MyImageFolder(
+    #         f"../datasets/imagenet/val/",
+    #         transform=MyImageFolder.get_val_transform(self.hparams.test_run))
+    #
+    #     xray_tx = Kaggle_Dataset.get_val_transform(self.hparams.test_run)
+    #     # Remove grey scale to keep 3 channels
+    #     xray_tx.transforms = xray_tx.transforms[1:]
+    #     xray_d = Kaggle_Dataset(
+    #         f"../datasets/kaggle/stage_2_train_images_jpg/",
+    #         include='all',
+    #         transform=xray_tx)
+    #
+    #     test_sets = [orig_test_d, gn_d, un_d, imgnet_d, xray_d]
+    #     self.test_sets_names = ['orig', 'gn', 'un', 'imgnet', 'xray']
+    #     return test_sets
 
     @classmethod
     def add_model_specific_args(cls, parser):

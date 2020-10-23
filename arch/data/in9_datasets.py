@@ -24,10 +24,21 @@ class IN9Dataset(ImageFolder):
     def __init__(self, train_dir='../datasets/bg_challenge/train/original/train/',
                  no_fg_dir='../datasets/bg_challenge/train/no_fg/train/',
                  cf_inpaint_dir=None,
+                 mask_only=False,
                  **kwargs):
         self.train_dir = train_dir
         self.no_fg_dir = no_fg_dir
         self.cf_inpaint_dir = cf_inpaint_dir
+
+        if mask_only:
+            mask_f = '../datasets/bg_challenge/train/original/have_mask_files'
+            valid_files = set()
+            with open(mask_f) as fp:
+                for line in fp:
+                    valid_files.add(line.strip())
+            is_valid_file = lambda path: os.path.basename(path) in valid_files
+            kwargs['is_valid_file'] = is_valid_file
+
         super().__init__(train_dir, **kwargs)
 
     def __getitem__(self, index):
@@ -110,3 +121,7 @@ class IN9Dataset(ImageFolder):
             self, batch_size=batch_size, shuffle=shuffle,
             num_workers=workers, pin_memory=True, drop_last=False,
             collate_fn=bbox_utils.bbox_collate)
+
+    @property
+    def is_bbox_folder(self):
+        return True

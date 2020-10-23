@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn.functional as F
 from os.path import join as pjoin
@@ -12,6 +13,11 @@ import numpy as np
 from .base import EpochBaseLightningModel
 from ..data.imagenet_datasets import MyImageFolder, MyImagenetBoundingBoxFolder
 from ..data.in9_datasets import IN9Dataset
+from ..data.simulated_datasets import GaussianNoiseDataset, UniformNoiseDataset
+from ..data.xrayvision_datasets import Kaggle_Dataset
+from ..data.cct_datasets import MyCCT_Dataset
+from ..data.imagenet_datasets import MySubset
+
 from ..data import bbox_utils
 import torchvision as tv
 from .. import models
@@ -137,6 +143,44 @@ class IN9LightningModel(EpochBaseLightningModel):
                 transform=IN9Dataset.get_train_transform(self.hparams.test_run)
             )
 
+        def random_subset(dataset, num_data):
+            tmp = torch.Generator()
+            tmp.manual_seed(2020)
+
+            idxes = torch.randperm(len(dataset), generator=tmp)[:num_data]
+            return MySubset(dataset, idxes)
+
+        if self.hparams.data_ratio == 1.:
+            pass
+        elif 0. < self.hparams.data_ratio < 1.:
+            num_data = int(len(train_d) * self.hparams.data_ratio)
+            train_d = random_subset(train_d, num_data)
+        elif (self.hparams.data_ratio > 1. or self.hparams.data_ratio == -1) \
+            and self.train_dataset == 'original':
+            orig_filenames = set()
+            with open('../datasets/bg_challenge/train/original/train_filenames') as fp:
+                for line in fp:
+                    orig_filenames.add(line.strip())
+
+            def is_valid_file(path):
+                return os.path.basename(path) not in orig_filenames
+
+            more_train_d = MyImageFolder(
+                '../datasets/bg_challenge/train/in9l/train/',
+                is_valid_file=is_valid_file,
+                transform=MyImageFolder.get_train_transform(self.hparams.test_run))
+
+            if self.hparams.data_ratio > 1.:
+                more_data = self.hparams.data_ratio - 1.
+                num_data = int(len(train_d) * more_data)
+                if num_data < len(more_train_d):
+                    more_train_d = random_subset(more_train_d, num_data)
+
+            train_d = MyConcatDataset([train_d, more_train_d])
+        else:
+            raise NotImplementedError(
+                'Data ratio is wronly specified: ' + str(self.hparams.data_ratio))
+
         val_d = MyImageFolder(
             '../datasets/bg_challenge/train/%s/val/' % self.train_dataset,
             transform=MyImageFolder.get_val_transform(self.hparams.test_run))
@@ -156,6 +200,35 @@ class IN9LightningModel(EpochBaseLightningModel):
         return train_d, [val_d, orig_test_d, mixed_same_test_d,
                          mixed_rand_test_d, mixed_next_test_d]
 
+    def _make_test_datasets(self):
+        orig_test_d = MyImageFolder(
+            '../datasets/bg_challenge/test/original/val/',
+            transform=MyImageFolder.get_val_transform(self.hparams.test_run))
+
+        gn_d = GaussianNoiseDataset(num_samples=len(orig_test_d))
+        un_d = UniformNoiseDataset(num_samples=len(orig_test_d))
+        cct_d = MyCCT_Dataset(
+            '../datasets/cct/CaltechCameraTrapsECCV18.json',
+            transform=MyCCT_Dataset.get_val_bbox_transform()
+        )
+
+        xray_tx = Kaggle_Dataset.get_val_transform(self.hparams.test_run)
+        # Remove grey scale to keep 3 channels
+        xray_tx.transforms = xray_tx.transforms[1:]
+        xray_d = Kaggle_Dataset(
+            f"../datasets/kaggle/stage_2_train_images_jpg/",
+            include='all',
+            transform=xray_tx)
+
+        # Imagenet-O
+        imageneto_d = MyImageFolder(
+            '../datasets/imageneto/',
+            transform=MyImageFolder.get_val_transform(self.hparams.test_run))
+
+        test_sets = [orig_test_d, gn_d, un_d, cct_d, xray_d, imageneto_d]
+        self.test_sets_names = ['orig', 'gn', 'un', 'cct', 'xray', 'imageneto']
+        return test_sets
+
     @classmethod
     def add_model_specific_args(cls, parser):
         # To use bbox as mask or segmentation mask
@@ -172,6 +245,12 @@ class IN9LightningModel(EpochBaseLightningModel):
         parser.add_argument("--base_lr", type=float, default=0.05)
         parser.add_argument("--pl_model", type=str, default=cls.__name__)
         parser.add_argument("--reg_anneal", type=float, default=0.)
+
+        parser.add_argument("--data_ratio", type=float, default=1.,
+                            help='Specifies how many data to use. '
+                                 'Default is 1: it means just using the original dataset.'
+                                 'If bigger than 1, e.g. 2, then it adds 1x more data from'
+                                 'in9l dataset. If it is -1, then it uses all data in9l.')
         return parser
 
     def pl_trainer_args(self):

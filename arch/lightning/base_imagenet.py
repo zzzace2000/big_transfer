@@ -19,6 +19,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 from .. import models, bit_hyperrule
 from ..data import bbox_utils
+from ..data.simulated_datasets import GaussianNoiseDataset, UniformNoiseDataset
+from ..data.xrayvision_datasets import Kaggle_Dataset
+from ..data.cct_datasets import MyCCT_Dataset
 from ..data.imagenet_datasets import MyImagenetBoundingBoxFolder, MyImageFolder, MyConcatDataset, MySubset, \
     MyImageNetODataset, MyFactualAndCFDataset
 from ..inpainting.VAEInpainter import VAEInpainter
@@ -105,8 +108,8 @@ class ImageNetLightningModel(BaseLightningModel):
                     torch.sum(torch.stack(metrics)) / all_size
 
         # 1st val loader
-        cal_output(outputs[0], 'test')
-        cal_output(outputs[1], 'val')
+        cal_output(outputs[0], 'val')
+        cal_output(outputs[1], 'test')
 
         # 3rd val loader
         if isinstance(outputs[0], list) and len(outputs) > 2:
@@ -140,27 +143,7 @@ class ImageNetLightningModel(BaseLightningModel):
         return [optimizer], [scheduler]
 
     def _make_train_val_dataset(self):
-        precrop, crop = bit_hyperrule.get_resolution_from_dataset(self.hparams.dataset)
-        if self.hparams.test_run:  # save memory
-            precrop, crop = 32, 28
-
-        train_tx = tv.transforms.Compose([
-            tv.transforms.Resize((precrop, precrop)),
-            tv.transforms.RandomCrop((crop, crop)),
-            tv.transforms.RandomHorizontalFlip(),
-            tv.transforms.ToTensor(),
-            tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ])
-        val_tx = tv.transforms.Compose([
-            tv.transforms.Resize((crop, crop)),
-            tv.transforms.ToTensor(),
-            tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ])
-
-        valid_sets = [MyImageFolder(f"../datasets/{self.hparams.dataset}/",
-                                    transform=val_tx)]
-
-        df = pd.read_csv(pjoin(self.hparams.datadir, 'LOC_train_solution_size.csv'))
+        df = pd.read_csv(pjoin('../datasets/imagenet/', 'LOC_train_solution_size.csv'))
         def has_bbox(bbox_max_ratio=1., inverse=False):
             bbox_filenames = set(df[df.bbox_ratio <= bbox_max_ratio].ImageId)
             def is_valid_file(path):
@@ -173,30 +156,24 @@ class ImageNetLightningModel(BaseLightningModel):
         train_sets = []
         # handle bbox dataset
         if self.hparams.bbox_data > 0.:
-            train_bbox_tx = tv.transforms.Compose([
-                bbox_utils.Resize((precrop, precrop)),
-                bbox_utils.RandomCrop((crop, crop)),
-                bbox_utils.RandomHorizontalFlip(),
-                bbox_utils.ToTensor(),
-                bbox_utils.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-            ])
             if self.hparams.inpaint == 'none' and self.hparams.reg == 'none' \
                     and self.hparams.f_inpaint == 'none':
                 bbox_d = MyImageFolder(
-                    pjoin(self.hparams.datadir, f"train_{self.hparams.dataset}"),
+                    pjoin('../datasets/imagenet/', f"train_{self.hparams.dataset}"),
                     is_valid_file=has_bbox(self.hparams.bbox_max_ratio),
-                    transform=train_tx)
+                    transform=MyImageFolder.get_train_transform(self.hparams.test_run))
             else:
                 cf_inpaint_dir = None
                 if self.hparams.inpaint == 'cagan':
                     cf_inpaint_dir = \
-                        pjoin(self.hparams.datadir, f"train_cagan_{self.hparams.dataset}")
+                        pjoin('../datasets/imagenet/', f"train_cagan_{self.hparams.dataset}")
                 bbox_d = MyImagenetBoundingBoxFolder(
-                    pjoin(self.hparams.datadir, f"train_{self.hparams.dataset}"),
-                    bbox_file=pjoin(self.hparams.datadir, 'LOC_train_solution.csv'),
+                    pjoin('../datasets/imagenet/', f"train_{self.hparams.dataset}"),
+                    bbox_file=pjoin('../datasets/imagenet/', 'LOC_train_solution.csv'),
                     is_valid_file=has_bbox(self.hparams.bbox_max_ratio),
                     cf_inpaint_dir=cf_inpaint_dir,
-                    transform=train_bbox_tx)
+                    transform=MyImagenetBoundingBoxFolder.get_train_transform(
+                        self.hparams.test_run))
 
             bbox_d, _ = self.sub_dataset(bbox_d, self.hparams.bbox_data)
             self.my_logger.info(f"W/ bbox total examples are {len(bbox_d)}")
@@ -206,9 +183,9 @@ class ImageNetLightningModel(BaseLightningModel):
         bbox_len = 0. if len(train_sets) == 0 else sum([len(d) for d in train_sets])
         if self.hparams.nobbox_data > 0.:
             nobbox_d = MyImageFolder(
-                pjoin(self.hparams.datadir, f"train_{self.hparams.dataset}"),
+                pjoin('../datasets/imagenet/', f"train_{self.hparams.dataset}"),
                 is_valid_file=has_bbox(inverse=True),
-                transform=train_tx)
+                transform=MyImageFolder.get_train_transform(self.hparams.test_run))
 
             nobbox_data = self.hparams.nobbox_data
             if nobbox_data <= 1.: # the ratio relative to the bbox data
@@ -221,27 +198,20 @@ class ImageNetLightningModel(BaseLightningModel):
         train_set = train_sets[0] if len(train_sets) == 1 \
             else MyConcatDataset(train_sets)
 
-        ## Add a second validation set
-        assert self.hparams.val_data > 0.
-        if not isinstance(train_set, MyConcatDataset) or not train_set.use_my_batch_sampler:
-            valid_set2, train_set = self.sub_dataset(train_set, self.hparams.val_data)
-        else:
-            new_train_set, new_valid_set2 = [], []
-            for d in train_set.datasets:
-                v, t = self.sub_dataset(d, self.hparams.val_data)
-                new_train_set.append(t)
-                new_valid_set2.append(v)
-            train_set = MyConcatDataset(new_train_set)
-            valid_set2 = MyConcatDataset(new_valid_set2)
-
-        valid_sets.append(valid_set2)
-
-        if self.hparams.dataset == 'imageneta': # add an imagenet-o OOD val loader
-            valid_set3 = MyImageNetODataset(
-                imageneto_dir="../datasets/imageneto/",
-                val_imgnet_dir="../datasets/imagenet/val_imageneto/",
-                transform=val_tx)
-            valid_sets.append(valid_set3)
+        ## Validation set
+        val_tx = MyImageFolder.get_val_transform(self.hparams.test_run)
+        valid_sets = [
+            MyImageFolder(f"../datasets/imagenet/val_{self.hparams.dataset}/",
+                          transform=val_tx), # Orig test set
+            MyImageFolder(f"../datasets/{self.hparams.dataset}/",
+                          transform=val_tx), # Imagenet-a
+        ]
+        # if self.hparams.dataset == 'imageneta': # add an imagenet-o OOD val loader
+        #     valid_set3 = MyImageNetODataset(
+        #         imageneto_dir="../datasets/imageneto/",
+        #         val_imgnet_dir="../datasets/imagenet/val_imageneta/",
+        #         transform=val_tx)
+        #     valid_sets.append(valid_set3)
 
         # Hack to make the pl train for 1 epoch = this number of steps.
         # This hack does not work since inpainting would only need 50%
@@ -264,6 +234,75 @@ class ImageNetLightningModel(BaseLightningModel):
 
         return super().get_inpainting_model(inpaint)
 
+    def _make_test_datasets(self):
+        orig_test_d = MyImageFolder(
+            f"../datasets/imagenet/val_{self.hparams.dataset}/",
+            transform=MyImageFolder.get_val_transform(self.hparams.test_run))
+
+        gn_d = GaussianNoiseDataset(num_samples=len(orig_test_d))
+        un_d = UniformNoiseDataset(num_samples=len(orig_test_d))
+        cct_d = MyCCT_Dataset(
+            '../datasets/cct/CaltechCameraTrapsECCV18.json',
+            transform=MyCCT_Dataset.get_val_bbox_transform()
+        )
+
+        xray_tx = Kaggle_Dataset.get_val_transform(self.hparams.test_run)
+        # Remove grey scale to keep 3 channels
+        xray_tx.transforms = xray_tx.transforms[1:]
+        xray_d = Kaggle_Dataset(
+            f"../datasets/kaggle/stage_2_train_images_jpg/",
+            include='all',
+            transform=xray_tx)
+
+        imageneto_d = MyImageFolder(
+            '../datasets/imageneto/',
+            transform=MyImageFolder.get_val_transform(self.hparams.test_run))
+
+        test_sets = [orig_test_d, gn_d, un_d, cct_d, xray_d, imageneto_d]
+        self.test_sets_names = ['orig', 'gn', 'un', 'cct', 'xray', 'imageneto']
+        return test_sets
+
+    def test_step(self, batch, batch_idx, dataloader_idx=0):
+        '''
+        Override to calculate the original test accuacy to fix previous bugs
+        '''
+        if dataloader_idx != 0:
+            return super().test_step(batch, batch_idx, dataloader_idx)
+
+        x, y = batch
+        if isinstance(x, dict):
+            x = x['imgs']
+
+        logits = self(x)
+        prob = F.softmax(logits, dim=1)
+        anomaly_score = 1. - (prob.max(dim=1).values)
+        # Anomaly score...
+
+        acc1, acc5 = self.accuracy(logits, y, topk=(1, 5))
+        batch_size = x.new_tensor(x.shape[0])
+
+        output = {
+            'anomaly_score': anomaly_score,
+            'acc1': acc1 * batch_size,
+            'acc5': acc5 * batch_size,
+            'batch_size': batch_size,
+        }
+        return output
+
+    def test_epoch_end(self, outputs):
+        result = super().test_epoch_end(outputs)
+
+        tqdm_dict = result['log']
+
+        orig_output = outputs[0]
+        all_size = torch.stack([o['batch_size'] for o in orig_output]).sum()
+        for metric_name in ["acc1", "acc5"]:
+            metrics = [o[metric_name] for o in orig_output]
+            tqdm_dict['orig_test_%s' % metric_name] = \
+                torch.sum(torch.stack(metrics)) / all_size
+
+        return result
+
     @classmethod
     def add_model_specific_args(cls, parser):  # pragma: no-cover
         parser.add_argument("--bbox_data", type=float, default=1.0)
@@ -278,11 +317,11 @@ class ImageNetLightningModel(BaseLightningModel):
                             help="Number of batches to compute gradient on before updating weights.")
         parser.add_argument("--base_lr", type=float, default=0.003,
                             help="Base learning-rate for fine-tuning. Most likely default is best.")
-        parser.add_argument("--eval_every", type=int, default=1000,
+        parser.add_argument("--eval_every", type=int, default=2000,
                             help="Run prediction on validation set every so many steps."
                                  "Will always run one evaluation at the end of training.")
-        parser.add_argument("--val_data", type=float, default=2000)
-        parser.add_argument("--test_data", type=float, default=2000)
+        # parser.add_argument("--val_data", type=float, default=2000)
+        # parser.add_argument("--test_data", type=float, default=2000)
         parser.add_argument("--pl_model", type=str, default=cls.__name__)
         parser.add_argument("--reg_anneal", type=float, default=0.)
         parser.add_argument("--lr_steps", type=int, default=10000)
@@ -291,9 +330,9 @@ class ImageNetLightningModel(BaseLightningModel):
     def pl_trainer_args(self):
         checkpoint_callback = ModelCheckpoint(
             filepath=pjoin(self.hparams.logdir, self.hparams.name, '{gstep}'),
-            save_top_k=-1,
+            save_top_k=1,
             save_last=True,
-            period=-1,  # -1 then it saves checkpts within an epoch
+            period=-1, # -1 then it saves checkpts within an epoch
             verbose=True,
             monitor='val_acc1',
             mode='max',
@@ -313,13 +352,17 @@ class ImageNetLightningModel(BaseLightningModel):
 
         return args
 
-    def is_finished_run(self):
-        last_ckpt = pjoin(self.hparams.logdir, self.hparams.name, 'last.ckpt')
+    @classmethod
+    def is_finished_run(cls, model_dir):
+        last_ckpt = pjoin(model_dir, 'last.ckpt')
         if pexists(last_ckpt):
-            last_gstep = torch.load(last_ckpt)['global_step']
-            if last_gstep >= (self.lr_supports[-1] - 1):
+            tmp = torch.load(last_ckpt,
+                             map_location=torch.device('cpu'))
+            last_gstep = tmp['global_step']
+            hparams = tmp['hyper_parameters']
+            if last_gstep >= (hparams.get('lr_steps', 10000) - 1):
                 print('Already finish fitting! Max %d Last %d'
-                      % (self.lr_supports[-1], last_gstep))
+                      % (hparams.get('lr_steps', 10000), last_gstep))
                 return True
 
         return False

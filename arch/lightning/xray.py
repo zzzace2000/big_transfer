@@ -28,8 +28,6 @@ class XRayLightningModel(EpochBaseLightningModel):
                               growth_rate=32,
                               block_config=(6, 12, 24, 16),
                               num_init_features=64)
-        # self.model = models.KNOWN_MODELS['BiT-S-R50x1'](
-        #     head_size=2, zero_head=False, in_channels=1)
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         x, y = batch
