@@ -19,6 +19,7 @@ from os.path import join as pjoin  # pylint: disable=g-importing-member
 from os.path import exists as pexists
 import json
 
+import argparse
 from argparse import ArgumentParser, Namespace
 import os
 import random
@@ -82,6 +83,7 @@ def get_args():
     parser.add_argument("--reg_coeff", type=float, default=0.)
     parser.add_argument("--cf", type=str, default='logp') # ['logp', 'uni', 'uni_e']
     parser.add_argument("--cf_coeff", type=float, default=1.)
+    # parser.add_argument("--2xchannels", type=int, default=0)
     # parser.add_argument("--use_mixup", type=int, default=0)
     parser.add_argument("--test_run", type=int, default=1)
     parser.add_argument("--fp16", type=int, default=1)
@@ -89,33 +91,37 @@ def get_args():
 
     temp_args, _ = parser.parse_known_args()
 
-    # If model directory exists, just use the hparams saved in the original directory
+    # setup which lightning model to use
+    pl_model_dict = {
+        'objectnet': ImageNetLightningModel.__name__,
+        'imageneta': ImageNetLightningModel.__name__,
+        'xray': XRayLightningModel.__name__,
+        'cct': CCTLightningModel.__name__,
+        'in9': IN9LightningModel.__name__,
+        'in9l': IN9LLightningModel.__name__,
+    }
+    temp_args.pl_model = pl_model_dict[temp_args.dataset]
+    parser = eval(temp_args.pl_model).add_model_specific_args(parser)
+
     saved_hparams = pjoin('models', temp_args.name, 'hparams.json')
-    if pexists(saved_hparams) and temp_args.test_run == 0:
-        print('Reload from the previous run hyperparameter!')
-        hparams = json.load(open(saved_hparams))
-        args = Namespace(**hparams)
-    else:
-        # setup which lightning model to use
-        if temp_args.dataset in ['objectnet', 'imageneta']:
-            temp_args.pl_model = ImageNetLightningModel.__name__
-        elif temp_args.dataset == 'xray':
-            temp_args.pl_model = XRayLightningModel.__name__
-        elif temp_args.dataset == 'cct':
-            temp_args.pl_model = CCTLightningModel.__name__
-        elif temp_args.dataset == 'in9':
-            temp_args.pl_model = IN9LightningModel.__name__
-        elif temp_args.dataset == 'in9l':
-            temp_args.pl_model = IN9LLightningModel.__name__
-        else:
-            raise NotImplementedError(temp_args.dataset)
-
-        parser = eval(temp_args.pl_model).add_model_specific_args(parser)
+    if not pexists(saved_hparams):
         args = parser.parse_args()
+    else:
+        hparams = json.load(open(saved_hparams))
 
-        args.logdir = './models/'
-        args.result_dir = './results/'
-        os.makedirs(args.result_dir, exist_ok=True)
+        # Remove default value. Only parse user inputs
+        for action in parser._actions:
+            action.default = argparse.SUPPRESS
+        input_args = parser.parse_args()
+        print('Reload and update from inputs: ' + str(input_args))
+        if len(vars(input_args)) > 0:
+            hparams.update(vars(input_args))
+            json.dump(hparams, open(saved_hparams, 'w'))
+        args = Namespace(**hparams)
+
+    args.logdir = './models/'
+    args.result_dir = './results/'
+    os.makedirs(args.result_dir, exist_ok=True)
 
     # on v server
     if not pexists(pjoin(args.logdir, args.name)) \

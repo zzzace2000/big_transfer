@@ -9,7 +9,7 @@ from arch.utils import output_csv
 
 all_names = [
     d for d in os.listdir('./models/')
-    if d.startswith('0927_9')
+    if d.startswith('1013_cct_random_frandom_bbox_o_reg100_')
     #    or d.startswith('0926_imageneta')
     #    or d.startswith('0922_2_imageneta')
     #    or d.startswith('0929')
@@ -32,8 +32,11 @@ for name in all_names:
 
     csv_dict = OrderedDict()
     csv_dict['name'] = hparams['name']
+    csv_dict['epoch'] = best_metric['epoch']
+    if 'data_ratio' not in hparams:
+        hparams['data_ratio'] = 1
     csv_dict.update(best_metric)
     csv_dict.update(hparams)
 
-    fname = pjoin('results', f'CCTLightningModel_results_val_auc2.tsv')
+    fname = pjoin('results', f'CCTLightningModel_results.tsv')
     output_csv(fname, csv_dict, delimiter='\t')

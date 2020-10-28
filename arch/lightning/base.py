@@ -167,15 +167,15 @@ class BaseLightningModel(LightningModule):
                 raise RuntimeError(f'metric {name} is Nan')
 
         tqdm_dict = {'train_loss': c,
-                     'cf_loss': c_cf,
-                     'reg_loss': reg_loss,
+                     'cf_loss': c_cf.detach(),
+                     'reg_loss': reg_loss.detach(),
                      'train_acc1': acc1,
                      'train_cf_acc1': cf_acc1}
         output = OrderedDict({
             'loss': c + c_cf + reg_loss,
-            'train_loss': c,
-            'cf_loss': c_cf,
-            'reg_loss': reg_loss,
+            'train_loss': c.detach(),
+            'cf_loss': c_cf.detach(),
+            'reg_loss': reg_loss.detach(),
             'acc1': acc1,
             'cf_acc1': cf_acc1,
             'progress_bar': tqdm_dict,
@@ -319,31 +319,30 @@ class BaseLightningModel(LightningModule):
         raise NotImplementedError()
 
     @staticmethod
-    def sub_dataset(bbox_dataset, subset_data, sec_dataset=None):
+    def sub_dataset(bbox_dataset, num_subset, sec_dataset=None):
         if sec_dataset is not None:
             assert len(sec_dataset) == len(bbox_dataset)
 
-        if subset_data == 0.:
+        if num_subset == 0:
             if sec_dataset is None:
                 return None, bbox_dataset
             return None, bbox_dataset, None, sec_dataset
-        if subset_data == 1. or subset_data >= len(bbox_dataset):
+        if num_subset >= len(bbox_dataset):
             if sec_dataset is None:
                 return bbox_dataset, None
             return bbox_dataset, None, sec_dataset, None
 
-        num = int(subset_data)
-        if subset_data < 1.:
-            num = int(len(bbox_dataset) * subset_data)
+        tmp = torch.Generator()
+        tmp.manual_seed(2020)
 
-        indices = torch.randperm(len(bbox_dataset))
-        first_dataset = MySubset(bbox_dataset, indices=indices[:num])
-        rest_dataset = MySubset(bbox_dataset, indices=indices[num:])
+        indices = torch.randperm(len(bbox_dataset), generator=tmp)
+        first_dataset = MySubset(bbox_dataset, indices=indices[:num_subset])
+        rest_dataset = MySubset(bbox_dataset, indices=indices[num_subset:])
         if sec_dataset is None:
             return first_dataset, rest_dataset
 
-        fs = MySubset(sec_dataset, indices=indices[:num])
-        rs = MySubset(sec_dataset, indices=indices[num:])
+        fs = MySubset(sec_dataset, indices=indices[:num_subset])
+        rs = MySubset(sec_dataset, indices=indices[num_subset:])
         return first_dataset, rest_dataset, fs, rs
 
     def get_inpainting_model(self, inpaint):
@@ -436,8 +435,12 @@ class BaseLightningModel(LightningModule):
         }
         return result
 
+    def is_data_ratio_exp(self):
+        return False
+
     def _make_test_datasets(self):
-        raise None
+        # Return None if no test set exists
+        return None
 
     @classmethod
     def add_model_specific_args(cls, parser):  # pragma: no-cover

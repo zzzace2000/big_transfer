@@ -167,8 +167,8 @@ class XRayLightningModel(EpochBaseLightningModel):
         parser.add_argument("--batch_split", type=int, default=1,
                             help="Number of batches to compute gradient on before updating weights.")
         parser.add_argument("--base_lr", type=float, default=0.003)
-        parser.add_argument("--val_data", type=float, default=2000 / 25227)
-        parser.add_argument("--test_data", type=float, default=5000 / 30227)
+        parser.add_argument("--val_data", type=int, default=2000)
+        parser.add_argument("--test_data", type=int, default=5000)
         parser.add_argument("--pl_model", type=str, default=cls.__name__)
         parser.add_argument("--reg_anneal", type=float, default=0.)
         return parser

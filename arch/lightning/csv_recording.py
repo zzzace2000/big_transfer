@@ -6,6 +6,7 @@ from collections import OrderedDict
 import pandas as pd
 import numpy as np
 from argparse import Namespace
+import sys
 
 from ..utils import output_csv
 from .base_imagenet import ImageNetLightningModel
@@ -29,11 +30,9 @@ class CSVRecordingCallback(pl.Callback):
     def on_train_end(self, trainer, pl_module):
         result_f = pjoin(pl_module.hparams.logdir, pl_module.hparams.name,
                          'results.tsv')
-        if not pexists(result_f):
-            return
+        assert pexists(result_f), 'Result %s should exists!' % result_f
 
         df = pd.read_csv(result_f, delimiter='\t')
-
         if isinstance(pl_module, ImageNetLightningModel): # 'imageneta'
             # Use the last step as the final model!
             best_idx = -1
@@ -52,10 +51,17 @@ class CSVRecordingCallback(pl.Callback):
             else pl_module.hparams)
 
         postfix = '_test' if pl_module.hparams.test_run else ''
+        dr_exp = 'dr_' if pl_module.is_data_ratio_exp() else ''
         fname = pjoin(pl_module.hparams.result_dir,
-                      f'{pl_module.__class__.__name__}_results{postfix}.tsv')
-        output_csv(fname,
-                   csv_dict, delimiter='\t')
+                      f'{pl_module.__class__.__name__}_{dr_exp}results{postfix}.tsv')
+
+        # Check if already exists
+        if not pexists(fname):
+            output_csv(fname, csv_dict, delimiter='\t')
+        else:
+            tmp_df = pd.read_csv(fname, delimiter='\t')
+            if pl_module.hparams.name not in set(tmp_df['name']):
+                output_csv(fname, csv_dict, delimiter='\t')
 
         bpath = pjoin(pl_module.hparams.logdir, pl_module.hparams.name, 'best.ckpt')
         if isinstance(pl_module, ImageNetLightningModel): # 'imageneta'
@@ -67,13 +73,14 @@ class CSVRecordingCallback(pl.Callback):
 
     def on_test_start(self, trainer, pl_module):
         # Check if it already runs
+        dr_exp = 'dr_' if pl_module.is_data_ratio_exp() else ''
         ood_fname = pjoin(pl_module.hparams.result_dir,
-                          f'{pl_module.__class__.__name__}_ood_results.tsv')
+                          f'{pl_module.__class__.__name__}_{dr_exp}ood_results.tsv')
         if pexists(ood_fname):
             ood_df = pd.read_csv(ood_fname, delimiter='\t')
             if pl_module.hparams.name in set(ood_df['name']):
                 print('Already ood test for %s. Exit!' % pl_module.hparams.name)
-                exit()
+                sys.exit()
 
         # For OOD detections
         bpath = pjoin(pl_module.hparams.logdir, pl_module.hparams.name, 'best.ckpt')
@@ -101,8 +108,9 @@ class CSVRecordingCallback(pl.Callback):
                          if k not in ['epoch', 'global_step']})
 
         postfix = '_test' if pl_module.hparams.test_run else ''
+        dr_exp = 'dr_' if pl_module.is_data_ratio_exp() else ''
         fname = pjoin(pl_module.hparams.result_dir,
-                      f'{pl_module.__class__.__name__}_ood_results{postfix}.tsv')
+                      f'{pl_module.__class__.__name__}_{dr_exp}ood_results{postfix}.tsv')
         output_csv(fname, csv_dict, delimiter='\t')
 
 

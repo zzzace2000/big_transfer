@@ -22,6 +22,9 @@ from ..saliency_utils import get_grad_y, get_grad_sum, \
 
 class CCTLightningModel(EpochBaseLightningModel):
     def init_setup(self):
+        if 'data_ratio' not in self.hparams:
+            self.hparams.data_ratio = 1
+
         # Resnet 50
         self.model = models.KNOWN_MODELS['BiT-S-R50x1'](
             head_size=15,
@@ -147,6 +150,12 @@ class CCTLightningModel(EpochBaseLightningModel):
             cf_inpaint_dir=cf_inpaint_dir,
             transform=MyCCT_Dataset.get_train_bbox_transform()
         )
+
+        dr = self.hparams.data_ratio
+        assert 0. < dr <= 1., 'Data ratio is invalid: ' + str(dr)
+        if dr < 1.:
+            train_d, _ = self.sub_dataset(train_d, num_subset=int(len(train_d) * dr))
+
         val_d = MyCCT_Dataset(
             '../datasets/cct/eccv_18_annotation_files/cis_val_annotations.json',
             transform=MyCCT_Dataset.get_val_bbox_transform()
@@ -185,6 +194,9 @@ class CCTLightningModel(EpochBaseLightningModel):
     #     self.test_sets_names = ['orig', 'gn', 'un', 'imgnet', 'xray']
     #     return test_sets
 
+    def is_data_ratio_exp(self):
+        return self.hparams.data_ratio != 1. or '_dr' in self.hparams.name
+
     @classmethod
     def add_model_specific_args(cls, parser):
         parser.add_argument("--max_epochs", type=int, default=50)
@@ -197,6 +209,11 @@ class CCTLightningModel(EpochBaseLightningModel):
         parser.add_argument("--base_lr", type=float, default=0.003)
         parser.add_argument("--pl_model", type=str, default=cls.__name__)
         parser.add_argument("--reg_anneal", type=float, default=0.)
+
+        parser.add_argument("--data_ratio", type=float, default=1.,
+                            help='Specifies how many data to use. '
+                                 'Default is 1: it means just using the cct dataset.'
+                                 'It can be only use 0~1.')
         return parser
 
     def pl_trainer_args(self):

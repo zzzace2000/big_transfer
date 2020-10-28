@@ -143,20 +143,13 @@ class IN9LightningModel(EpochBaseLightningModel):
                 transform=IN9Dataset.get_train_transform(self.hparams.test_run)
             )
 
-        def random_subset(dataset, num_data):
-            tmp = torch.Generator()
-            tmp.manual_seed(2020)
-
-            idxes = torch.randperm(len(dataset), generator=tmp)[:num_data]
-            return MySubset(dataset, idxes)
-
         if self.hparams.data_ratio == 1.:
             pass
         elif 0. < self.hparams.data_ratio < 1.:
             num_data = int(len(train_d) * self.hparams.data_ratio)
-            train_d = random_subset(train_d, num_data)
+            train_d, _ = self.sub_dataset(train_d, num_data)
         elif (self.hparams.data_ratio > 1. or self.hparams.data_ratio == -1) \
-            and self.train_dataset == 'original':
+                and self.train_dataset == 'original':
             orig_filenames = set()
             with open('../datasets/bg_challenge/train/original/train_filenames') as fp:
                 for line in fp:
@@ -174,12 +167,13 @@ class IN9LightningModel(EpochBaseLightningModel):
                 more_data = self.hparams.data_ratio - 1.
                 num_data = int(len(train_d) * more_data)
                 if num_data < len(more_train_d):
-                    more_train_d = random_subset(more_train_d, num_data)
+                    more_train_d, _ = self.sub_dataset(more_train_d, num_data)
 
             train_d = MyConcatDataset([train_d, more_train_d])
         else:
-            raise NotImplementedError(
-                'Data ratio is wronly specified: ' + str(self.hparams.data_ratio))
+            if self.hparams.data_ratio != 1.:
+                raise NotImplementedError(
+                    'Data ratio is wronly specified: ' + str(self.hparams.data_ratio))
 
         val_d = MyImageFolder(
             '../datasets/bg_challenge/train/%s/val/' % self.train_dataset,
@@ -228,6 +222,9 @@ class IN9LightningModel(EpochBaseLightningModel):
         test_sets = [orig_test_d, gn_d, un_d, cct_d, xray_d, imageneto_d]
         self.test_sets_names = ['orig', 'gn', 'un', 'cct', 'xray', 'imageneto']
         return test_sets
+
+    def is_data_ratio_exp(self):
+        return self.hparams.data_ratio != 1. or '_dr' in self.hparams.name
 
     @classmethod
     def add_model_specific_args(cls, parser):

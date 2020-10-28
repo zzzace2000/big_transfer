@@ -2,6 +2,7 @@ import os
 from collections import OrderedDict
 from os.path import join as pjoin  # pylint: disable=g-importing-member
 from os.path import exists as pexists
+import sys
 
 from argparse import Namespace
 import numpy as np
@@ -50,7 +51,7 @@ class ImageNetLightningModel(BaseLightningModel):
         if self.hparams.model in models.KNOWN_MODELS:
             self.model = models.KNOWN_MODELS[self.hparams.model](
                 head_size=KNOWN_NUM_CLASSES[self.hparams.dataset],
-                zero_head=True)
+                zero_head=self.hparams.finetune)
             if self.hparams.finetune:
                 self.my_logger.info("Fine-tuning from BiT")
                 self.model.load_from(np.load(f"models/{self.hparams.model}.npz"))
@@ -62,40 +63,28 @@ class ImageNetLightningModel(BaseLightningModel):
         #     self.mixup = bit_hyperrule.get_mixup(len(train_set))
 
     def on_fit_start(self):
-        if self.global_step >= self.lr_supports[-1]:
+        if self.global_step >= self.hparams.lr_steps:
             self.my_logger.info('Already finish training! Exit!')
-            exit()
+            sys.exit()
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        if dataloader_idx in [0, 1]:
-            images, target = batch
-            if isinstance(images, dict):
-                images = images['imgs']
+        # if dataloader_idx in [0, 1]:
+        images, target = batch
+        if isinstance(images, dict):
+            images = images['imgs']
 
-            output = self(images)
-            loss_val = F.cross_entropy(output, target, reduction='sum')
-            acc1, acc5 = self.accuracy(output, target, topk=(1, 5))
-            batch_size = images.new_tensor(images.shape[0])
+        output = self(images)
+        loss_val = F.cross_entropy(output, target, reduction='sum')
+        acc1, acc5 = self.accuracy(output, target, topk=(1, 5))
+        batch_size = images.new_tensor(images.shape[0])
 
-            output = OrderedDict({
-                'loss': loss_val,
-                'acc1': acc1 * batch_size,
-                'acc5': acc5 * batch_size,
-                'batch_size': batch_size,
-            })
-            return output
-
-        # for imagenet-o
-        if dataloader_idx == 2:
-            x, y = batch
-            logits = self(x)
-            anomaly_score = -(logits.max(dim=1).values)
-
-            output = OrderedDict({
-                'as': anomaly_score,
-                'y': y,
-            })
-            return output
+        output = OrderedDict({
+            'loss': loss_val,
+            'acc1': acc1 * batch_size,
+            'acc5': acc5 * batch_size,
+            'batch_size': batch_size,
+        })
+        return output
 
     def validation_epoch_end(self, outputs):
         tqdm_dict = {}
@@ -112,13 +101,13 @@ class ImageNetLightningModel(BaseLightningModel):
         cal_output(outputs[1], 'test')
 
         # 3rd val loader
-        if isinstance(outputs[0], list) and len(outputs) > 2:
-            the_outputs = outputs[2]
-            anomaly_scores = torch.cat([o['as'] for o in the_outputs])
-            ys = torch.cat([o['y'] for o in the_outputs])
-
-            tqdm_dict['imgneto_aupr'] = average_precision_score(
-                ys.cpu().numpy(), anomaly_scores.cpu().numpy())
+        # if isinstance(outputs[0], list) and len(outputs) > 2:
+        #     the_outputs = outputs[2]
+        #     anomaly_scores = torch.cat([o['as'] for o in the_outputs])
+        #     ys = torch.cat([o['y'] for o in the_outputs])
+        #
+        #     tqdm_dict['imgneto_aupr'] = average_precision_score(
+        #         ys.cpu().numpy(), anomaly_scores.cpu().numpy())
 
         result = {
             'progress_bar': tqdm_dict, 'log': tqdm_dict,
@@ -144,8 +133,8 @@ class ImageNetLightningModel(BaseLightningModel):
 
     def _make_train_val_dataset(self):
         df = pd.read_csv(pjoin('../datasets/imagenet/', 'LOC_train_solution_size.csv'))
-        def has_bbox(bbox_max_ratio=1., inverse=False):
-            bbox_filenames = set(df[df.bbox_ratio <= bbox_max_ratio].ImageId)
+        def has_bbox(inverse=False):
+            bbox_filenames = set(df[df.bbox_ratio <= self.hparams.bbox_max_ratio].ImageId)
             def is_valid_file(path):
                 ans = os.path.basename(path).split('.')[0] in bbox_filenames
                 if inverse:
@@ -154,44 +143,43 @@ class ImageNetLightningModel(BaseLightningModel):
             return is_valid_file
 
         train_sets = []
-        # handle bbox dataset
-        if self.hparams.bbox_data > 0.:
-            if self.hparams.inpaint == 'none' and self.hparams.reg == 'none' \
-                    and self.hparams.f_inpaint == 'none':
-                bbox_d = MyImageFolder(
-                    pjoin('../datasets/imagenet/', f"train_{self.hparams.dataset}"),
-                    is_valid_file=has_bbox(self.hparams.bbox_max_ratio),
-                    transform=MyImageFolder.get_train_transform(self.hparams.test_run))
-            else:
-                cf_inpaint_dir = None
-                if self.hparams.inpaint == 'cagan':
-                    cf_inpaint_dir = \
-                        pjoin('../datasets/imagenet/', f"train_cagan_{self.hparams.dataset}")
-                bbox_d = MyImagenetBoundingBoxFolder(
-                    pjoin('../datasets/imagenet/', f"train_{self.hparams.dataset}"),
-                    bbox_file=pjoin('../datasets/imagenet/', 'LOC_train_solution.csv'),
-                    is_valid_file=has_bbox(self.hparams.bbox_max_ratio),
-                    cf_inpaint_dir=cf_inpaint_dir,
-                    transform=MyImagenetBoundingBoxFolder.get_train_transform(
-                        self.hparams.test_run))
 
-            bbox_d, _ = self.sub_dataset(bbox_d, self.hparams.bbox_data)
-            self.my_logger.info(f"W/ bbox total examples are {len(bbox_d)}")
-            train_sets.append(bbox_d)
+        # handle bbox dataset
+        assert self.hparams.bbox_data > 0.
+        if self.hparams.inpaint == 'none' and self.hparams.reg == 'none' \
+                and self.hparams.f_inpaint == 'none':
+            bbox_d = MyImageFolder(
+                pjoin('../datasets/imagenet/', f"train_{self.hparams.dataset}"),
+                is_valid_file=has_bbox(),
+                transform=MyImageFolder.get_train_transform(self.hparams.test_run))
+        else:
+            cf_inpaint_dir = None
+            if self.hparams.inpaint == 'cagan':
+                cf_inpaint_dir = \
+                    pjoin('../datasets/imagenet/', f"train_cagan_{self.hparams.dataset}")
+            bbox_d = MyImagenetBoundingBoxFolder(
+                pjoin('../datasets/imagenet/', f"train_{self.hparams.dataset}"),
+                bbox_file=pjoin('../datasets/imagenet/', 'LOC_train_solution.csv'),
+                is_valid_file=has_bbox(),
+                cf_inpaint_dir=cf_inpaint_dir,
+                transform=MyImagenetBoundingBoxFolder.get_train_transform(
+                    self.hparams.test_run))
+
+        num = int(len(bbox_d) * self.hparams.bbox_data)
+        bbox_d, _ = self.sub_dataset(bbox_d, num)
+        self.my_logger.info(f"W/ bbox total examples are {len(bbox_d)}")
+        train_sets.append(bbox_d)
 
         # handle no bbox dataset
-        bbox_len = 0. if len(train_sets) == 0 else sum([len(d) for d in train_sets])
-        if self.hparams.nobbox_data > 0.:
+        if self.hparams.nobbox_data > 0. or self.hparams.nobbox_data == -1:
             nobbox_d = MyImageFolder(
                 pjoin('../datasets/imagenet/', f"train_{self.hparams.dataset}"),
                 is_valid_file=has_bbox(inverse=True),
                 transform=MyImageFolder.get_train_transform(self.hparams.test_run))
 
-            nobbox_data = self.hparams.nobbox_data
-            if nobbox_data <= 1.: # the ratio relative to the bbox data
-                assert self.hparams.bbox_data > 0.
-                nobbox_data = int(bbox_len * nobbox_data)
-            nobbox_d, _ = self.sub_dataset(nobbox_d, nobbox_data)
+            if self.hparams.nobbox_data > 0.:
+                num_nobbox_data = int(self.hparams.nobbox_data * len(bbox_d))
+                nobbox_d, _ = self.sub_dataset(nobbox_d, num_nobbox_data)
             self.my_logger.info(f"W/o bbox total examples are {len(nobbox_d)}")
             train_sets.append(nobbox_d)
 
@@ -206,16 +194,8 @@ class ImageNetLightningModel(BaseLightningModel):
             MyImageFolder(f"../datasets/{self.hparams.dataset}/",
                           transform=val_tx), # Imagenet-a
         ]
-        # if self.hparams.dataset == 'imageneta': # add an imagenet-o OOD val loader
-        #     valid_set3 = MyImageNetODataset(
-        #         imageneto_dir="../datasets/imageneto/",
-        #         val_imgnet_dir="../datasets/imagenet/val_imageneta/",
-        #         transform=val_tx)
-        #     valid_sets.append(valid_set3)
 
         # Hack to make the pl train for 1 epoch = this number of steps.
-        # This hack does not work since inpainting would only need 50%
-        # samples to get. So this is just an upper bound.
         train_set.my_num_samples = \
             (self.hparams.batch * (self.lr_supports[-1]))
         return train_set, valid_sets
@@ -303,15 +283,19 @@ class ImageNetLightningModel(BaseLightningModel):
 
         return result
 
+    def is_data_ratio_exp(self):
+        return self.hparams.bbox_data != 1. or self.hparams.nobbox_data != 0. \
+            or 'bd' in self.hparams.name
+
     @classmethod
     def add_model_specific_args(cls, parser):  # pragma: no-cover
-        parser.add_argument("--bbox_data", type=float, default=1.0)
+        parser.add_argument("--bbox_data", type=float, default=1.)
         parser.add_argument("--bbox_max_ratio", type=float, default=0.5)
-        parser.add_argument("--nobbox_data", type=float, default=1.)
+        parser.add_argument("--nobbox_data", type=float, default=0.)
 
         parser.add_argument("--batch", type=int, default=32,
                             help="Batch size.")
-        parser.add_argument("--val_batch", type=int, default=256,
+        parser.add_argument("--val_batch", type=int, default=512,
                             help="Batch size.")
         parser.add_argument("--batch_split", type=int, default=1,
                             help="Number of batches to compute gradient on before updating weights.")
@@ -324,7 +308,7 @@ class ImageNetLightningModel(BaseLightningModel):
         # parser.add_argument("--test_data", type=float, default=2000)
         parser.add_argument("--pl_model", type=str, default=cls.__name__)
         parser.add_argument("--reg_anneal", type=float, default=0.)
-        parser.add_argument("--lr_steps", type=int, default=10000)
+        parser.add_argument("--lr_steps", type=int, default=20000)
         return parser
 
     def pl_trainer_args(self):
@@ -343,7 +327,7 @@ class ImageNetLightningModel(BaseLightningModel):
             val_check_interval *= self.hparams.batch_split
 
         args = dict()
-        args['max_steps'] = self.lr_supports[-1]
+        args['max_steps'] = self.hparams.lr_steps
         args['val_check_interval'] = val_check_interval
         args['checkpoint_callback'] = checkpoint_callback
         last_ckpt = pjoin(self.hparams.logdir, self.hparams.name, 'last.ckpt')
